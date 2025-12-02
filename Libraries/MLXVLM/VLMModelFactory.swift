@@ -163,6 +163,11 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Write a haiku about Swift programming"
     )
 
+    static public let qwen3VL2BInstruct4Bit = ModelConfiguration(
+        id: "mlx-community/Qwen3-VL-2B-Instruct-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
     static public let smolvlminstruct4bit = ModelConfiguration(
         id: "mlx-community/SmolVLM-Instruct-4bit",
         defaultPrompt: "Describe the image in English"
@@ -204,6 +209,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen2_5VL3BInstruct4Bit,
             qwen3VL4BInstruct4Bit,
             qwen3VL4BInstruct8Bit,
+            qwen3VL2BInstruct4Bit,
             smolvlminstruct4bit,
             gemma3_4B_qat_4bit,
             gemma3_12B_qat_4bit,

@@ -1,6 +1,8 @@
 // Copyright © 2025 Apple Inc.
 
+import AVFoundation
 import CoreImage
+import CoreMedia
 import Foundation
 import Hub
 import MLX
@@ -16,7 +18,7 @@ private enum Qwen3VLError: Error {
 
 public final class Qwen3VLProcessor: UserInputProcessor {
 
-    private let config: Qwen3VLProcessorConfiguration
+    public var config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
 
     public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer) {
@@ -45,8 +47,8 @@ public final class Qwen3VLProcessor: UserInputProcessor {
             height: Int(extent.height),
             width: Int(extent.width),
             factor: config.patchSize * config.mergeSize,
-            minPixels: config.size.minPixels,
-            maxPixels: config.size.maxPixels)
+            minPixels: config.minPixels,
+            maxPixels: config.maxPixels)
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
 
@@ -104,7 +106,7 @@ public final class Qwen3VLProcessor: UserInputProcessor {
 
             for video in input.videos {
                 let sequence = try await MediaProcessing.asProcessedSequence(
-                    video.asAVAsset(), samplesPerSecond: 2
+                    video.asAVAsset(), maxFrames: config.maxFrames, targetFPS: { _ in config.fps }
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     if resizedSize == .zero {
@@ -152,6 +154,192 @@ public final class Qwen3VLProcessor: UserInputProcessor {
             image: processedImage,
             video: processedVideo)
     }
+    
+    /// Prepare input with specific frame specification for selective video processing
+    /// 
+    /// This method allows you to control which frames from videos are processed
+    /// during the preprocessing stage, enabling more efficient video analysis.
+    /// 
+    /// - Parameter input: The user input containing text, images, and/or videos
+    /// - Parameter frameSpecification: Which frames to process from videos
+    /// - Returns: The prepared LMInput with selective frame processing
+    /// - Throws: VLMError if video processing fails
+    public func prepareWithFrameSpecification(input: UserInput, frameSpecification: Qwen3VL.FrameSpecification) async throws -> LMInput {
+        let messages = Qwen3VLMessageGenerator().generate(from: input)
+        var promptTokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools)
+
+        // Text-only input
+        if input.images.isEmpty, input.videos.isEmpty {
+            let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
+            let mask = ones(like: promptArray).asType(.int8)
+            return LMInput(text: .init(tokens: promptArray, mask: mask))
+        }
+
+        // Process images if any
+        var processedImage: LMInput.ProcessedImage?
+        if !input.images.isEmpty {
+            let imageFrames = try input.images.map {
+                try preprocess(images: [$0.asCIImage()], processing: input.processing)
+            }
+            let concatenated = concatenated(imageFrames.map { $0.0 })
+            processedImage = .init(pixels: concatenated, frames: imageFrames.map { $0.1 })
+
+            if let frames = processedImage?.frames {
+                promptTokens = try QwenVL.replacePaddingTokens(
+                    in: promptTokens,
+                    frames: frames,
+                    paddingToken: "<|image_pad|>",
+                    mergeSize: config.mergeSize,
+                    tokenizer: tokenizer)
+            }
+        }
+
+        // Process videos with frame specification
+        var processedVideo: LMInput.ProcessedVideo?
+        if !input.videos.isEmpty {
+            var accumulatedFrames: [[MLXArray]] = []
+            var resizedSize: CGSize = .zero
+            
+            for video in input.videos {
+                let imageSequence: [MLXArray]
+                
+                switch frameSpecification {
+                case .allFrames:
+                    // Process all frames as before
+                    let sequence = try await MediaProcessing.asProcessedSequence(
+                        video.asAVAsset(), maxFrames: config.maxFrames, targetFPS: { _ in config.fps }
+                    ) { frame in
+                        let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
+                        if resizedSize == .zero {
+                            let size = processed.extent.size
+                            let (height, width) = try QwenVL.targetSize(
+                                height: Int(size.height),
+                                width: Int(size.width),
+                                factor: config.patchSize * config.mergeSize,
+                                minPixels: config.minPixels,
+                                maxPixels: config.maxPixels)
+                            resizedSize = CGSize(width: width, height: height)
+                        }
+                        let finalImage = preprocess(image: processed, resizedSize: resizedSize)
+                        return VideoFrame(frame: finalImage, timeStamp: frame.timeStamp)
+                    }
+                    imageSequence = sequence.frames
+                    
+                case .frameNumbers(let frameNumbers):
+                    // Process only specified frame numbers
+                    let asset = video.asAVAsset()
+                    let duration = try await asset.load(.duration)
+                    let durationSeconds = CMTimeGetSeconds(duration)
+                    let maxFrame = Int(durationSeconds * config.fps) - 1
+                    
+                    let validFrameNumbers = frameNumbers.filter { $0 >= 0 && $0 <= maxFrame }
+                    if validFrameNumbers.isEmpty {
+                        throw NSError(domain: "VideoProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "No valid frame numbers provided"])
+                    }
+                    
+                    imageSequence = try await processSpecificFrames(
+                        asset: asset,
+                        frameNumbers: validFrameNumbers,
+                        processing: input.processing,
+                        resizedSize: &resizedSize
+                    )
+                    
+                case .timestamps(let timestamps):
+                    // Process frames at specific timestamps
+                    let asset = video.asAVAsset()
+                    let fps = config.fps
+                    let frameNumbers = timestamps.map { Int($0 * fps) }
+                    
+                    imageSequence = try await processSpecificFrames(
+                        asset: asset,
+                        frameNumbers: frameNumbers,
+                        processing: input.processing,
+                        resizedSize: &resizedSize
+                    )
+                }
+                
+                accumulatedFrames.append(imageSequence)
+            }
+            
+            let videoFrames = try accumulatedFrames.map {
+                try QwenVL.patchify(
+                    images: $0,
+                    mergeSize: config.mergeSize,
+                    patchSize: config.patchSize,
+                    temporalPatchSize: config.temporalPatchSize)
+            }
+
+            let concatenated = concatenated(videoFrames.map { $0.0 })
+            processedVideo = .init(pixels: concatenated, frames: videoFrames.map { $0.1 })
+
+            if let frames = processedVideo?.frames {
+                promptTokens = try QwenVL.replacePaddingTokens(
+                    in: promptTokens,
+                    frames: frames,
+                    paddingToken: "<|video_pad|>",
+                    mergeSize: config.mergeSize,
+                    tokenizer: tokenizer)
+            }
+        }
+
+        let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
+        let mask = ones(like: promptArray).asType(.int8)
+
+        return LMInput(
+            text: .init(tokens: promptArray, mask: mask),
+            image: processedImage,
+            video: processedVideo)
+    }
+    
+    /// Helper method to process specific frames from a video asset
+    private func processSpecificFrames(
+        asset: AVAsset,
+        frameNumbers: [Int],
+        processing: UserInput.Processing?,
+        resizedSize: inout CGSize
+    ) async throws -> [MLXArray] {
+        var imageSequence: [MLXArray] = []
+        
+        for frameNumber in frameNumbers {
+            let timestamp = TimeInterval(frameNumber) / config.fps
+            let frameImage = try await extractFrameFromAsset(asset, at: timestamp)
+            
+            let resizedImage = MediaProcessing.apply(frameImage, processing: processing)
+            if resizedSize == .zero {
+                let size = resizedImage.extent.size
+                let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
+                    height: Int(size.height), width: Int(size.width),
+                    factor: config.patchSize * config.mergeSize,
+                    minPixels: config.minPixels, maxPixels: config.maxPixels)
+                resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
+            }
+            let processedImage = preprocess(image: resizedImage, resizedSize: resizedSize)
+            imageSequence.append(processedImage.asMLXArray())
+        }
+        
+        return imageSequence
+    }
+
+    /// Helper function to extract a single frame from an asset at a specific timestamp
+    private func extractFrameFromAsset(_ asset: AVAsset, at timestamp: TimeInterval) async throws -> CIImage {
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        
+        let cmTime = CMTime(seconds: timestamp, preferredTimescale: 600)
+        
+        do {
+            let cgImage = try await generator.image(at: cmTime).image
+            return CIImage(cgImage: cgImage, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+        } catch {
+            throw NSError(
+                domain: "VideoProcessing", 
+                code: -1, 
+                userInfo: [NSLocalizedDescriptionKey: "Failed to extract frame at timestamp \(timestamp): \(error.localizedDescription)"]
+            )
+        }
+    }
 }
 
 public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
@@ -174,9 +362,32 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
     public let patchSize: Int
     public let temporalPatchSize: Int
     public let imageProcessorType: String
+    
+    // Runtime settable properties
+    public var _runtimeMaxPixels: Int?
+    public var _runtimeMinPixels: Int?
+    public var _maxFrames: Int?
+    public var _fps: Double?
 
-    public var minPixels: Int { _minPixels ?? 4 * 28 * 28 }  // 3,136
-    public var maxPixels: Int { _maxPixels ?? 16384 * 28 * 28 }  // 12,845,056
+    public var minPixels: Int {
+        get { _runtimeMinPixels ?? _minPixels ?? 4 * 28 * 28 }  // 3,136
+        set { _runtimeMinPixels = newValue }
+    }
+    
+    public var maxPixels: Int {
+        get { _runtimeMaxPixels ?? _maxPixels ?? 16384 * 28 * 28 }  // 12,845,056
+        set { _runtimeMaxPixels = newValue }
+    }
+    
+    public var maxFrames: Int {
+        get { _maxFrames ?? Int.max }
+        set { _maxFrames = newValue }
+    }
+    
+    public var fps: Double {
+        get { _fps ?? 2.0 }
+        set { _fps = newValue }
+    }
 
     public var size: Size { .init(maxPixels: maxPixels, minPixels: minPixels) }
 
@@ -197,6 +408,10 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"
         case imageProcessorType = "image_processor_type"
+        case _runtimeMaxPixels = "runtime_max_pixels"
+        case _runtimeMinPixels = "runtime_min_pixels"
+        case _maxFrames = "max_frames"
+        case _fps = "fps"
     }
 }
 
@@ -1510,6 +1725,16 @@ extension Qwen3VLLanguage {
 
 public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
+    /// Frame specification for selective video processing
+    public enum FrameSpecification {
+        /// Process specific frame numbers (0-based indexing)
+        case frameNumbers([Int])
+        /// Process frames at specific timestamps (in seconds)
+        case timestamps([TimeInterval])
+        /// Process all frames (default behavior)
+        case allFrames
+    }
+
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") private var languageModel: Qwen3VLLanguage.LanguageModel
 
@@ -1682,6 +1907,802 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             videoGridTHW: videoFrames)
 
         return .logits(languageOutput)
+    }
+    
+    /// Prepare input with frame specification for selective video processing
+    /// 
+    /// This method allows you to control which frames from videos are processed
+    /// during the preprocessing stage, enabling more efficient video analysis.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let result = try model.prepareWithFrameSpecification(
+    ///     input: lmInput, 
+    ///     cache: cache, 
+    ///     windowSize: windowSize,
+    ///     frameSpecification: .frameNumbers([0, 10, 20, 30])
+    /// )
+    /// ```
+    /// 
+    /// - Parameter input: The LMInput containing processed text, images, and/or videos
+    /// - Parameter cache: The KV cache for the model
+    /// - Parameter windowSize: Optional window size for processing
+    /// - Parameter frameSpecification: Which frames to process (frame numbers, timestamps, or all frames)
+    /// - Parameter fps: Frames per second for timestamp conversion (default: 2.0)
+    /// - Returns: The prepared result with selective frame processing
+    /// - Throws: VLMError if video processing fails
+    public func prepareWithFrameSpecification(_ input: LMInput, cache: [any KVCache], windowSize _: Int?, frameSpecification: FrameSpecification, fps: Double = 2.0) throws -> PrepareResult {
+        let inputIds = input.text.tokens
+        let inputMask = input.text.mask
+
+        var pixelValues: MLXArray?
+        var imageFrames: [THW]? = nil
+        var videoFrames: [THW]? = nil
+
+        let dtype = visionModel.patchEmbed.proj.weight.dtype
+
+        var pixelParts: [MLXArray] = []
+
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(dtype))
+            imageFrames = image.frames
+        }
+
+        if let video = input.video, let frames = video.frames {
+            // Apply frame specification filtering to video frames
+            let (filteredPixels, filteredFrames) = try applyFrameSpecificationToVideo(
+                videoPixels: video.pixels,
+                videoFrames: frames,
+                frameSpecification: frameSpecification,
+                fps: fps
+            )
+            pixelParts.append(filteredPixels.asType(dtype))
+            videoFrames = filteredFrames
+        }
+
+        if !pixelParts.isEmpty {
+            pixelValues = concatenated(pixelParts)
+        }
+
+        var inputEmbeddings: MLXArray? = nil
+        var visualMask: MLXArray?
+        var deepstackEmbeds: [MLXArray]? = nil
+
+        if let pixelValues,
+            let framesList = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+                .nilIfEmpty
+        {
+            let textEmbeds = languageModel.model.embedTokens(inputIds)
+            let (visionHidden, deepstackOutputs) = visionModel(pixelValues, gridTHW: framesList)
+            let mergeSize = config.visionConfiguration.spatialMergeSize
+            let splits = framesList.map { $0.product / (mergeSize * mergeSize) }
+            let splitIndices = cumulativeSplitIndices(from: splits)
+            let featureSlices = visionHidden.split(indices: splitIndices)
+            let flattenedFeatures = concatenated(featureSlices).asType(textEmbeds.dtype)
+
+            let (mergedEmbeds, mask) = try mergeInputIdsWithImageFeatures(
+                imageFeatures: flattenedFeatures,
+                inputEmbeds: textEmbeds,
+                inputIds: inputIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex)
+
+            inputEmbeddings = mergedEmbeds
+            visualMask = mask
+
+            if !deepstackOutputs.isEmpty {
+                deepstackEmbeds = deepstackOutputs.map { layerFeatures in
+                    let splitIndices = cumulativeSplitIndices(from: splits)
+                    let slices = layerFeatures.split(indices: splitIndices)
+                    let concatenatedSlices = concatenated(slices).asType(textEmbeds.dtype)
+                    return concatenatedSlices
+                }
+            }
+        }
+
+        let typedCache = castCache(cache)
+
+        let languageOutput = languageModel(
+            inputIds,
+            cache: typedCache,
+            inputEmbeddings: inputEmbeddings,
+            mask: nil,
+            positionIds: nil,
+            visualMask: visualMask,
+            deepstackEmbeds: deepstackEmbeds,
+            pixelValues: pixelValues,
+            imageGridTHW: imageFrames,
+            videoGridTHW: videoFrames)
+
+        return .logits(languageOutput)
+    }
+    
+    /// Helper method to apply frame specification filtering to video data
+    private func applyFrameSpecificationToVideo(
+        videoPixels: MLXArray, 
+        videoFrames: [THW],
+        frameSpecification: FrameSpecification,
+        fps: Double
+    ) throws -> (MLXArray, [THW]) {
+        switch frameSpecification {
+        case .allFrames:
+            return (videoPixels, videoFrames)
+            
+        case .frameNumbers(let frameNumbers):
+            let validIndices = frameNumbers.filter { $0 >= 0 && $0 < videoFrames.count }
+            if validIndices.isEmpty {
+                throw NSError(domain: "VideoProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "No valid frame numbers provided"])
+            }
+            
+            let filteredPixels = videoPixels[MLXArray(validIndices), 0..., 0..., 0...]
+            let filteredFrames = validIndices.map { videoFrames[$0] }
+            return (filteredPixels, filteredFrames)
+            
+        case .timestamps(let timestamps):
+            // For timestamps, we assume the frames are evenly distributed
+            // This is a simplified implementation - in practice, you'd want to map timestamps to actual frame indices
+            let frameNumbers = timestamps.map { Int($0 * fps) } // Use provided FPS for timestamp conversion
+            return try applyFrameSpecificationToVideo(
+                videoPixels: videoPixels, 
+                videoFrames: videoFrames,
+                frameSpecification: .frameNumbers(frameNumbers),
+                fps: fps
+            )
+        }
+    }
+
+    /// Extract patch embeddings from a single image
+    /// 
+    /// This function preprocesses the image and applies patch embedding to get the initial hidden states.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let image = CIImage(contentsOf: imageURL)!
+    /// let patchEmbeddings = try model.extractPatchEmbeddings(from: image, processorConfig: processorConfig)
+    /// // patchEmbeddings shape: [numPatches, embedDimensions]
+    /// ```
+    /// 
+    /// - Parameter image: The input image as a CIImage
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: The patch embeddings as an MLXArray
+    /// - Throws: VLMError if image processing fails
+    public func extractPatchEmbeddings(
+        from image: CIImage, 
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) throws -> MLXArray {
+        // Apply user processing if provided
+        let processedImage = MediaProcessing.apply(image, processing: processing)
+        
+        // Calculate target size for resizing
+        let size = processedImage.extent.size
+        let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
+            height: Int(size.height), width: Int(size.width),
+            factor: processorConfig.patchSize * processorConfig.mergeSize,
+            minPixels: processorConfig.minPixels, maxPixels: processorConfig.maxPixels)
+
+        let resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
+        print("Resized size: \(resizedSize)")
+        print("patchSize: \(processorConfig.patchSize), mergeSize: \(processorConfig.mergeSize), minPixels: \(processorConfig.minPixels), maxPixels: \(processorConfig.maxPixels)")
+
+        // Preprocess the image (resize, normalize)
+        let normalizedImage = processedImage
+            .toSRGB()
+            .resampled(to: resizedSize, method: .bicubic)
+            .normalized(mean: processorConfig.imageMeanTuple, std: processorConfig.imageStdTuple)
+        
+        // Convert to MLXArray
+        let imageArray = normalizedImage.asMLXArray()
+        
+        // Patchify the image
+        let (pixelValues, frames) = try QwenVL.patchify(
+            images: [imageArray], 
+            mergeSize: processorConfig.mergeSize, 
+            patchSize: processorConfig.patchSize,
+            temporalPatchSize: processorConfig.temporalPatchSize
+        )
+        
+        // Convert to the correct data type for the patch embed
+        let dtype = visionModel.patchEmbed.proj.weight.dtype
+        let typedPixelValues = pixelValues.asType(dtype)
+        
+        // Apply patch embedding: var hiddenStates = patchEmbed(hiddenStates)
+        let hiddenStates = visionModel.patchEmbed(typedPixelValues)
+        
+        // Print the dimensions of the hidden states
+        print("Hidden states dimensions: \(hiddenStates.shape)")
+        print("Hidden states size: \(hiddenStates.size)")
+        print("Hidden states data type: \(hiddenStates.dtype)")
+        
+        // Calculate size in bytes based on the actual data type
+        let bytesPerElement: Int
+        switch hiddenStates.dtype {
+        case .float16:
+            bytesPerElement = 2
+        case .float32:
+            bytesPerElement = 4
+        case .float64:
+            bytesPerElement = 8
+        default:
+            bytesPerElement = 4 // fallback
+        }
+        print("Hidden states size in bytes: \(hiddenStates.size * bytesPerElement)")
+        
+        return hiddenStates
+    }
+
+    /// Extract patch embeddings from a video by processing each frame
+    /// 
+    /// This function processes each frame of a video, extracts patch embeddings,
+    /// and returns an array of patch embeddings for each frame.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let videoURL = URL(fileURLWithPath: "video.mp4")
+    /// let frameEmbeddings = try model.extractVideoPatchEmbeddings(from: videoURL, processorConfig: processorConfig)
+    /// // frameEmbeddings is an array of MLXArray, one for each frame
+    /// ```
+    /// 
+    /// - Parameter videoURL: The URL of the video file
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: Array of patch embeddings for each frame
+    /// - Throws: VLMError if video processing fails
+    public func extractVideoPatchEmbeddings(
+        from videoURL: URL,
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) async throws -> [MLXArray] {
+        // Extract CIImage frames from video
+        let ciImages = try await MediaProcessing.asCIImageSequence(
+            AVAsset(url: videoURL), 
+            samplesPerSecond: Int(processorConfig.fps)
+        )
+        
+        var frameEmbeddings: [MLXArray] = []
+        
+        // Process each frame
+        for (index, frameImage) in ciImages.enumerated() {
+            print("Processing frame \(index + 1)/\(ciImages.count)")
+            
+            let frameEmbedding = try extractPatchEmbeddings(
+                from: frameImage,
+                processing: processing,
+                processorConfig: processorConfig
+            )
+            
+            frameEmbeddings.append(frameEmbedding)
+        }
+        
+        print("Successfully extracted patch embeddings for \(frameEmbeddings.count) frames")
+        return frameEmbeddings
+    }
+
+    /// Extract and mean-pool patch embeddings from a single image into a 1D vector
+    /// 
+    /// This function preprocesses the image, applies patch embedding, and then mean-pools
+    /// the resulting patch embeddings into a single 1D feature vector.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let image = CIImage(contentsOf: imageURL)!
+    /// let pooledEmbeddings = try model.extractAndPoolEmbeddings(from: image, processorConfig: processorConfig)
+    /// // pooledEmbeddings shape: [embedDimensions] (1D vector)
+    /// ```
+    /// 
+    /// - Parameter image: The input image as a CIImage
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: The mean-pooled embeddings as a 1D MLXArray
+    /// - Throws: VLMError if image processing fails
+    public func extractAndPoolEmbeddings(
+        from image: CIImage, 
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) throws -> MLXArray {
+        // Get the patch embeddings
+        let patchEmbeddings = try extractPatchEmbeddings(
+            from: image, 
+            processing: processing, 
+            processorConfig: processorConfig
+        )
+        
+        // Mean-pool across the patch dimension (first dimension)
+        let pooledEmbeddings = mean(patchEmbeddings, axis: 0)
+        
+        // Print information about the pooled embeddings
+        print("Pooled embeddings dimensions: \(pooledEmbeddings.shape)")
+        print("Pooled embeddings size: \(pooledEmbeddings.size)")
+        print("Pooled embeddings data type: \(pooledEmbeddings.dtype)")
+        
+        // Calculate size in bytes based on the actual data type
+        let bytesPerElement: Int
+        switch pooledEmbeddings.dtype {
+        case .float16:
+            bytesPerElement = 2
+        case .float32:
+            bytesPerElement = 4
+        case .float64:
+            bytesPerElement = 8
+        default:
+            bytesPerElement = 4 // fallback
+        }
+        print("Pooled embeddings size in bytes: \(pooledEmbeddings.size * bytesPerElement)")
+        
+        return pooledEmbeddings
+    }
+
+    /// Extract and mean-pool embeddings from a video by processing each frame
+    /// 
+    /// This function processes each frame of a video, extracts patch embeddings,
+    /// mean-pools them, and returns an array of 1D feature vectors for each frame.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let videoURL = URL(fileURLWithPath: "video.mp4")
+    /// let frameEmbeddings = try model.extractAndPoolVideoEmbeddings(from: videoURL, processorConfig: processorConfig)
+    /// // frameEmbeddings is an array of 1D MLXArray, one for each frame
+    /// ```
+    /// 
+    /// - Parameter videoURL: The URL of the video file
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: Array of mean-pooled embeddings for each frame
+    /// - Throws: VLMError if video processing fails
+    public func extractAndPoolVideoEmbeddings(
+        from videoURL: URL,
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) async throws -> [MLXArray] {
+        // Extract CIImage frames from video
+        let ciImages = try await MediaProcessing.asCIImageSequence(
+            AVAsset(url: videoURL), 
+            samplesPerSecond: Int(processorConfig.fps)
+        )
+        
+        var frameEmbeddings: [MLXArray] = []
+        
+        // Process each frame
+        for (index, frameImage) in ciImages.enumerated() {
+            print("Processing frame \(index + 1)/\(ciImages.count)")
+            
+            let frameEmbedding = try extractAndPoolEmbeddings(
+                from: frameImage,
+                processing: processing,
+                processorConfig: processorConfig
+            )
+            
+            frameEmbeddings.append(frameEmbedding)
+        }
+        
+        print("Successfully extracted and mean-pooled embeddings for \(frameEmbeddings.count) frames")
+        return frameEmbeddings
+    }
+
+    /// Calculate cosine distance between two mean-pooled embeddings
+    /// 
+    /// This function computes the cosine distance between two 1D feature vectors
+    /// obtained from mean-pooled patch embeddings. Cosine distance is 1 - cosine_similarity.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let image1 = CIImage(contentsOf: imageURL1)!
+    /// let image2 = CIImage(contentsOf: imageURL2)!
+    /// 
+    /// let embedding1 = try model.extractAndPoolEmbeddings(from: image1, processorConfig: processorConfig)
+    /// let embedding2 = try model.extractAndPoolEmbeddings(from: image2, processorConfig: processorConfig)
+    /// let distance = model.cosineDistance(embedding1, embedding2)
+    /// // distance is a value between 0 and 2, where 0 means identical
+    /// ```
+    /// 
+    /// - Parameter embedding1: First 1D embedding vector
+    /// - Parameter embedding2: Second 1D embedding vector
+    /// - Returns: Cosine distance value between 0 and 2
+    public func cosineDistance(_ embedding1: MLXArray, _ embedding2: MLXArray) -> Float {
+        // Ensure both embeddings are 1D
+        let vec1 = embedding1.flattened()
+        let vec2 = embedding2.flattened()
+        
+        // Calculate dot product
+        let dotProduct = sum(vec1 * vec2)
+        
+        // Calculate magnitudes
+        let magnitude1 = sqrt(sum(vec1 * vec1))
+        let magnitude2 = sqrt(sum(vec2 * vec2))
+        
+        // Calculate cosine similarity first
+        let similarity = dotProduct / (magnitude1 * magnitude2)
+        
+        // Convert to cosine distance (1 - similarity)
+        let distance = 1.0 - similarity.item() as Float
+        
+        // Handle potential NaN
+        return distance.isNaN ? 2.0 : distance
+    }
+
+    /// Calculate cosine distance between each frame and the first frame as reference
+    /// 
+    /// This function extracts mean-pooled embeddings from each frame of a video
+    /// and calculates cosine distance between each frame and the first frame.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let videoURL = URL(fileURLWithPath: "video.mp4")
+    /// let distances = try model.calculateVideoFrameDistances(from: videoURL, processorConfig: processorConfig)
+    /// // distances is an array of Float values, one for each frame
+    /// ```
+    /// 
+    /// - Parameter videoURL: The URL of the video file
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: Array of cosine distance values for each frame (first frame will be 0.0)
+    /// - Throws: VLMError if video processing fails
+    public func calculateVideoFrameDistances(
+        from videoURL: URL,
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) async throws -> [Float] {
+        // Extract mean-pooled embeddings from each frame
+        let frameEmbeddings = try await extractAndPoolVideoEmbeddings(
+            from: videoURL,
+            processing: processing,
+            processorConfig: processorConfig
+        )
+        
+        guard !frameEmbeddings.isEmpty else {
+            throw NSError(domain: "VideoProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "No frames extracted from video"])
+        }
+        
+        let referenceEmbedding = frameEmbeddings[0]
+        var similarities: [Float] = []
+        
+        // Calculate distance between each frame and the reference frame
+        for (index, frameEmbedding) in frameEmbeddings.enumerated() {
+            let distance = cosineDistance(referenceEmbedding, frameEmbedding)
+            similarities.append(distance)
+            
+            print("Frame \(index + 1) distance to reference: \(distance)")
+        }
+        
+        print("Successfully calculated similarities for \(similarities.count) frames")
+        return similarities
+    }
+
+    /// Helper function to extract a single frame from an asset at a specific timestamp
+    private func extractFrameFromAsset(_ asset: AVAsset, at timestamp: TimeInterval) async throws -> CIImage {
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        
+        let cmTime = CMTime(seconds: timestamp, preferredTimescale: 600)
+        
+        do {
+            let cgImage = try await generator.image(at: cmTime).image
+            return CIImage(cgImage: cgImage, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+        } catch {
+            throw NSError(
+                domain: "VideoProcessing", 
+                code: -1, 
+                userInfo: [NSLocalizedDescriptionKey: "Failed to extract frame at timestamp \(timestamp): \(error.localizedDescription)"]
+            )
+        }
+    }
+
+    /// Extract and mean-pool embeddings from specific frames of a video
+    /// 
+    /// This function processes only the specified frames of a video, extracts patch embeddings,
+    /// mean-pools them, and returns an array of 1D feature vectors for each specified frame.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let videoURL = URL(fileURLWithPath: "video.mp4")
+    /// 
+    /// // Process specific frame numbers
+    /// let frameEmbeddings = try model.extractAndPoolVideoEmbeddings(
+    ///     from: videoURL, 
+    ///     frameSpecification: .frameNumbers([0, 10, 20, 30]),
+    ///     processorConfig: processorConfig
+    /// )
+    /// 
+    /// // Process frames at specific timestamps
+    /// let frameEmbeddings = try model.extractAndPoolVideoEmbeddings(
+    ///     from: videoURL, 
+    ///     frameSpecification: .timestamps([0.0, 5.0, 10.0, 15.0]),
+    ///     processorConfig: processorConfig
+    /// )
+    /// ```
+    /// 
+    /// - Parameter videoURL: The URL of the video file
+    /// - Parameter frameSpecification: Which frames to process (frame numbers, timestamps, or all frames)
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: Array of mean-pooled embeddings for each specified frame
+    /// - Throws: VLMError if video processing fails
+    public func extractAndPoolVideoEmbeddings(
+        from videoURL: URL,
+        frameSpecification: FrameSpecification = .allFrames,
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) async throws -> [MLXArray] {
+        // Get video asset and duration
+        let asset = AVAsset(url: videoURL)
+        let duration = try await asset.load(.duration)
+        let durationSeconds = CMTimeGetSeconds(duration)
+        
+        print("Video duration: \(String(format: "%.2f", durationSeconds)) seconds")
+        
+        // Determine which frames to process
+        let framesToProcess: [Int]
+        let frameTimestamps: [TimeInterval]
+        
+        switch frameSpecification {
+        case .frameNumbers(let frameNumbers):
+            framesToProcess = frameNumbers.sorted()
+            frameTimestamps = frameNumbers.map { TimeInterval($0) / processorConfig.fps }
+            print("Processing specific frame numbers: \(frameNumbers)")
+            
+        case .timestamps(let timestamps):
+            let sortedTimestamps = timestamps.sorted()
+            framesToProcess = sortedTimestamps.map { Int($0 * processorConfig.fps) }
+            frameTimestamps = sortedTimestamps
+            print("Processing frames at timestamps: \(timestamps.map { String(format: "%.2f", $0) })")
+            
+        case .allFrames:
+            // Extract all frames as before
+            let ciImages = try await MediaProcessing.asCIImageSequence(
+                AVAsset(url: videoURL), 
+                samplesPerSecond: Int(processorConfig.fps)
+            )
+            
+            var frameEmbeddings: [MLXArray] = []
+            
+            // Process each frame
+            for (index, frameImage) in ciImages.enumerated() {
+                print("Processing frame \(index + 1)/\(ciImages.count)")
+                
+                let frameEmbedding = try extractAndPoolEmbeddings(
+                    from: frameImage,
+                    processing: processing,
+                    processorConfig: processorConfig
+                )
+                
+                frameEmbeddings.append(frameEmbedding)
+            }
+            
+            print("Successfully extracted and mean-pooled embeddings for \(frameEmbeddings.count) frames")
+            return frameEmbeddings
+        }
+        
+        // Validate frame numbers
+        let maxFrameNumber = Int(durationSeconds * processorConfig.fps)
+        let validFrames = framesToProcess.filter { $0 >= 0 && $0 < maxFrameNumber }
+        
+        if validFrames.count != framesToProcess.count {
+            let invalidFrames = framesToProcess.filter { $0 < 0 || $0 >= maxFrameNumber }
+            print("Warning: Invalid frame numbers ignored: \(invalidFrames)")
+        }
+        
+        guard !validFrames.isEmpty else {
+            throw NSError(domain: "VideoProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "No valid frames to process"])
+        }
+        
+        print("Processing \(validFrames.count) valid frames out of \(framesToProcess.count) requested")
+        // Extract specific frames using MediaProcessing
+        var frameEmbeddings: [MLXArray] = []
+        
+        for (index, frameNumber) in validFrames.enumerated() {
+            let timestamp = frameTimestamps[index]
+            print("Processing frame \(frameNumber) at timestamp \(String(format: "%.2f", timestamp))s (\(index + 1)/\(validFrames.count))")
+            
+            // Extract single frame at specific timestamp
+            let frameImage = try await extractFrameFromAsset(asset, at: timestamp)
+            
+            let frameEmbedding = try extractAndPoolEmbeddings(
+                from: frameImage,
+                processing: processing,
+                processorConfig: processorConfig
+            )
+            
+            frameEmbeddings.append(frameEmbedding)
+        }
+        
+        print("Successfully extracted and mean-pooled embeddings for \(frameEmbeddings.count) specified frames")
+        return frameEmbeddings
+    }
+
+    /// Calculate cosine distance between specified frames and the first frame as reference
+    /// 
+    /// This function extracts mean-pooled embeddings from specified frames of a video
+    /// and calculates cosine distance between each frame and the first frame.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let videoURL = URL(fileURLWithPath: "video.mp4")
+    /// 
+    /// // Calculate distances for specific frames
+    /// let distances = try model.calculateVideoFrameDistances(
+    ///     from: videoURL, 
+    ///     frameSpecification: .frameNumbers([0, 10, 20, 30]),
+    ///     processorConfig: processorConfig
+    /// )
+    /// ```
+    /// 
+    /// - Parameter videoURL: The URL of the video file
+    /// - Parameter frameSpecification: Which frames to process (frame numbers, timestamps, or all frames)
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: Array of cosine distance values for each frame (first frame will be 0.0)
+    /// - Throws: VLMError if video processing fails
+    public func calculateVideoFrameDistances(
+        from videoURL: URL,
+        frameSpecification: FrameSpecification = .allFrames,
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) async throws -> [Float] {
+        // Extract mean-pooled embeddings from specified frames
+        let frameEmbeddings = try await extractAndPoolVideoEmbeddings(
+            from: videoURL,
+            frameSpecification: frameSpecification,
+            processing: processing,
+            processorConfig: processorConfig
+        )
+        
+        guard !frameEmbeddings.isEmpty else {
+            throw NSError(domain: "VideoProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "No frames extracted from video"])
+        }
+        
+        let referenceEmbedding = frameEmbeddings[0]
+        var similarities: [Float] = []
+        
+        // Calculate distance between each frame and the reference frame
+        for (index, frameEmbedding) in frameEmbeddings.enumerated() {
+            let distance = cosineDistance(referenceEmbedding, frameEmbedding)
+            similarities.append(distance)
+            
+            print("Frame \(index + 1) distance to reference: \(distance)")
+        }
+        
+        print("Successfully calculated similarities for \(similarities.count) frames")
+        return similarities
+    }
+
+    /// Detect scene changes in a video using cosine distance threshold
+    /// 
+    /// This function analyzes each frame of a video and detects scene changes
+    /// by comparing each frame to a reference frame. When distance exceeds
+    /// the threshold, it marks a scene change and updates the reference frame.
+    /// 
+    /// Example usage:
+    /// ```swift
+    /// let model = Qwen3VL(config)
+    /// let processorConfig = Qwen3VLProcessorConfiguration(...)
+    /// let videoURL = URL(fileURLWithPath: "video.mp4")
+    /// let sceneChanges = try model.detectSceneChanges(from: videoURL, threshold: 0.1, processorConfig: processorConfig)
+    /// // sceneChanges contains frame indices where scene changes occur
+    /// ```
+    /// 
+    /// - Parameter videoURL: The URL of the video file
+    /// - Parameter threshold: Cosine distance threshold for scene change detection (default: 0.1)
+    /// - Parameter minSceneDuration: Minimum scene duration in seconds (default: 2.0)
+    /// - Parameter maxSceneDuration: Maximum scene duration in seconds (default: 15.0)
+    /// - Parameter processing: Optional processing parameters for resizing, etc.
+    /// - Parameter processorConfig: The processor configuration containing minPixels and maxPixels
+    /// - Returns: Array of frame indices where scene changes occur (including frame 0)
+    /// - Throws: VLMError if video processing fails
+    public func detectSceneChanges(
+        from videoURL: URL,
+        threshold: Float = 0.1,
+        minSceneDuration: TimeInterval = 2.0, // Minimum scene duration in seconds
+        maxSceneDuration: TimeInterval = 15.0, // Maximum scene duration in seconds
+        processing: UserInput.Processing? = nil,
+        processorConfig: Qwen3VLProcessorConfiguration
+    ) async throws -> [(frameIndex: Int, timestamp: TimeInterval)] {
+        let startTime = Date()
+        
+        // Extract CIImage frames from video at configured FPS for scene detection
+        let ciImages = try await MediaProcessing.asCIImageSequence(
+            AVAsset(url: videoURL), 
+            samplesPerSecond: Int(processorConfig.fps)
+        )
+        
+        var frameEmbeddings: [MLXArray] = []
+        var frameTimestamps: [TimeInterval] = []
+        
+        // Process each frame
+        for (index, frameImage) in ciImages.enumerated() {
+            print("Processing frame \(index + 1)/\(ciImages.count)")
+            
+            let frameEmbedding = try extractAndPoolEmbeddings(
+                from: frameImage,
+                processing: processing,
+                processorConfig: processorConfig
+            )
+            
+            frameEmbeddings.append(frameEmbedding)
+            
+            // Calculate timestamp for this frame
+            let timestamp = TimeInterval(index) / processorConfig.fps
+            frameTimestamps.append(timestamp)
+        }
+        
+        guard !frameEmbeddings.isEmpty else {
+            throw NSError(domain: "VideoProcessing", code: -1, userInfo: [NSLocalizedDescriptionKey: "No frames extracted from video"])
+        }
+        
+        var sceneChanges: [(frameIndex: Int, timestamp: TimeInterval)] = [(0, 0.0)] // Always include frame 0 as first scene
+        var currentReferenceEmbedding = frameEmbeddings[0]
+        
+        print("Scene change detection with threshold: \(threshold), min scene duration: \(minSceneDuration)s, max scene duration: \(maxSceneDuration)s")
+        print("Frame 0 (0.0s): Starting new scene (reference frame)")
+        
+        // Analyze each frame starting from frame 1
+        for frameIndex in 1..<frameEmbeddings.count {
+            let currentEmbedding = frameEmbeddings[frameIndex]
+            let distance = cosineDistance(currentReferenceEmbedding, currentEmbedding)
+            let timestamp = frameTimestamps[frameIndex]
+            let timeSinceLastScene = timestamp - sceneChanges.last!.timestamp
+            
+            print("Frame \(frameIndex) (\(String(format: "%.1f", timestamp))s): distance to reference = \(String(format: "%.4f", distance)), time since last scene: \(String(format: "%.1f", timeSinceLastScene))s")
+            
+            var sceneChangeDetected = false
+            var sceneChangeReason = ""
+            
+            // Check if maximum scene duration has been exceeded
+            if timeSinceLastScene >= maxSceneDuration {
+                sceneChangeDetected = true
+                sceneChangeReason = "max duration exceeded"
+                print("Frame \(frameIndex) (\(String(format: "%.1f", timestamp))s): FORCED SCENE CHANGE - Max duration exceeded (\(String(format: "%.1f", timeSinceLastScene))s >= \(maxSceneDuration)s)")
+            }
+            // Check if distance threshold is exceeded and minimum duration is met
+            else if distance > threshold && timeSinceLastScene >= minSceneDuration {
+                sceneChangeDetected = true
+                sceneChangeReason = "distance threshold"
+                print("Frame \(frameIndex) (\(String(format: "%.1f", timestamp))s): SCENE CHANGE DETECTED - Distance threshold exceeded (duration: \(String(format: "%.1f", timeSinceLastScene))s)")
+            }
+            // Check if distance threshold is exceeded but minimum duration is not met
+            else if distance > threshold && timeSinceLastScene < minSceneDuration {
+                print("Frame \(frameIndex) (\(String(format: "%.1f", timestamp))s): Scene change ignored - too short (duration: \(String(format: "%.1f", timeSinceLastScene))s < \(minSceneDuration)s)")
+            }
+            
+            if sceneChangeDetected {
+                sceneChanges.append((frameIndex: frameIndex, timestamp: timestamp))
+                currentReferenceEmbedding = currentEmbedding
+                print("Frame \(frameIndex) (\(String(format: "%.1f", timestamp))s): SCENE CHANGE APPLIED - \(sceneChangeReason) (duration: \(String(format: "%.1f", timeSinceLastScene))s)")
+            }
+        }
+        
+        let endTime = Date()
+        let duration = endTime.timeIntervalSince(startTime)
+        
+        print("Scene change detection complete!")
+        print("Total scenes detected: \(sceneChanges.count)")
+        print("Scene changes at frames and timestamps:")
+        for (frameIndex, timestamp) in sceneChanges {
+            print("  Frame \(frameIndex): \(String(format: "%.1f", timestamp))s")
+        }
+        print("Total processing time: \(String(format: "%.2f", duration)) seconds")
+        print("Average time per frame: \(String(format: "%.3f", duration / Double(frameEmbeddings.count))) seconds")
+        
+        return sceneChanges
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
