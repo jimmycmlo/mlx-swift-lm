@@ -10,6 +10,88 @@ import MLXLMCommon
 import MLXNN
 import Tokenizers
 
+// MARK: - Profiling
+
+private struct ProfilingStats {
+    static var applyInterleavedMRopeTime: Double = 0
+    static var applyInterleavedMRopeCount: Int = 0
+    static var rotaryEmbeddingTime: Double = 0
+    static var rotaryEmbeddingCount: Int = 0
+    static var positionIDTime: Double = 0
+    static var positionIDCount: Int = 0
+    static var attentionTime: Double = 0
+    static var attentionCount: Int = 0
+    static var modelForwardTime: Double = 0
+    static var modelForwardCount: Int = 0
+    static var languageModelTime: Double = 0
+    static var languageModelCount: Int = 0
+    static var lmHeadTime: Double = 0
+    static var lmHeadCount: Int = 0
+    
+    static func reset() {
+        applyInterleavedMRopeTime = 0
+        applyInterleavedMRopeCount = 0
+        rotaryEmbeddingTime = 0
+        rotaryEmbeddingCount = 0
+        positionIDTime = 0
+        positionIDCount = 0
+        attentionTime = 0
+        attentionCount = 0
+        modelForwardTime = 0
+        modelForwardCount = 0
+        languageModelTime = 0
+        languageModelCount = 0
+        lmHeadTime = 0
+        lmHeadCount = 0
+    }
+    
+    static func printStats() {
+        print("\n=== Qwen3VL Profiling Stats ===")
+        if applyInterleavedMRopeCount > 0 {
+            let avg = applyInterleavedMRopeTime * 1000 / Double(applyInterleavedMRopeCount)
+            print("applyInterleavedMRope: \(String(format: "%.2f", applyInterleavedMRopeTime * 1000))ms total, \(applyInterleavedMRopeCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if rotaryEmbeddingCount > 0 {
+            let avg = rotaryEmbeddingTime * 1000 / Double(rotaryEmbeddingCount)
+            print("rotaryEmbedding: \(String(format: "%.2f", rotaryEmbeddingTime * 1000))ms total, \(rotaryEmbeddingCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if positionIDCount > 0 {
+            let avg = positionIDTime * 1000 / Double(positionIDCount)
+            print("positionID computation: \(String(format: "%.2f", positionIDTime * 1000))ms total, \(positionIDCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if attentionCount > 0 {
+            let avg = attentionTime * 1000 / Double(attentionCount)
+            print("attention: \(String(format: "%.2f", attentionTime * 1000))ms total, \(attentionCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if modelForwardCount > 0 {
+            let avg = modelForwardTime * 1000 / Double(modelForwardCount)
+            print("model forward: \(String(format: "%.2f", modelForwardTime * 1000))ms total, \(modelForwardCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if languageModelCount > 0 {
+            let avg = languageModelTime * 1000 / Double(languageModelCount)
+            print("languageModel.callAsFunction: \(String(format: "%.2f", languageModelTime * 1000))ms total, \(languageModelCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if lmHeadCount > 0 {
+            let avg = lmHeadTime * 1000 / Double(lmHeadCount)
+            print("lmHead: \(String(format: "%.2f", lmHeadTime * 1000))ms total, \(lmHeadCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        let totalTime = applyInterleavedMRopeTime + rotaryEmbeddingTime + positionIDTime + attentionTime + modelForwardTime + languageModelTime + lmHeadTime
+        print("Total tracked time: \(String(format: "%.2f", totalTime * 1000))ms")
+        print("==============================\n")
+    }
+}
+
+// Public API for profiling
+public extension Qwen3VL {
+    static func printProfilingStats() {
+        ProfilingStats.printStats()
+    }
+    
+    static func resetProfilingStats() {
+        ProfilingStats.reset()
+    }
+}
+
 private enum Qwen3VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
 }
@@ -1117,6 +1199,13 @@ enum Qwen3VLLanguage {
 
         private let invFreq: MLXArray
         private let mropeSection: [Int]
+        private var cachedHMask: MLXArray?
+        private var cachedWMask: MLXArray?
+        private var cachedDims: Int = 0
+        private var cachedExpandedHMask: MLXArray?
+        private var cachedExpandedWMask: MLXArray?
+        private var cachedBatch: Int = 0
+        private var cachedSeqLen: Int = 0
 
         init(headDim: Int, base: Double, ropeScaling: Qwen3VLConfiguration.RoPEScaling?) {
             var freq = MLXArray(stride(from: 0, to: headDim, by: 2)).asType(.float32)
@@ -1125,31 +1214,98 @@ enum Qwen3VLLanguage {
             self.invFreq = 1.0 / pow(baseArray, freq)
             self.mropeSection = ropeScaling?.mropeSection ?? [24, 20, 20]
         }
+        
+        private func getMasks(dims: Int, batch: Int, seqLen: Int) -> (MLXArray?, MLXArray?) {
+            // Cache base masks if dimensions haven't changed
+            if cachedDims != dims || cachedHMask == nil || cachedWMask == nil {
+                let hEnd = min(mropeSection[1] * 3, dims)
+                let wEnd = min(mropeSection[2] * 3, dims)
+                
+                let indices = MLXArray(0 ..< dims).asType(.int32)
+                
+                if hEnd > 1 {
+                    let hMask = (indices .>= 1) .&& (indices .< hEnd) .&& ((indices - 1) % 3 .== 0)
+                    cachedHMask = hMask
+                } else {
+                    cachedHMask = nil
+                }
+                
+                if wEnd > 2 {
+                    let wMask = (indices .>= 2) .&& (indices .< wEnd) .&& ((indices - 2) % 3 .== 0)
+                    cachedWMask = wMask
+                } else {
+                    cachedWMask = nil
+                }
+                
+                cachedDims = dims
+                // Invalidate expanded masks when base masks change
+                cachedExpandedHMask = nil
+                cachedExpandedWMask = nil
+            }
+            
+            // Cache expanded masks if batch/seqLen haven't changed (common during generation)
+            if cachedBatch != batch || cachedSeqLen != seqLen || cachedExpandedHMask == nil || cachedExpandedWMask == nil {
+                if let hMask = cachedHMask {
+                    cachedExpandedHMask = broadcast(hMask.reshaped(1, 1, dims), to: [batch, seqLen, dims])
+                } else {
+                    cachedExpandedHMask = nil
+                }
+                
+                if let wMask = cachedWMask {
+                    cachedExpandedWMask = broadcast(wMask.reshaped(1, 1, dims), to: [batch, seqLen, dims])
+                } else {
+                    cachedExpandedWMask = nil
+                }
+                
+                cachedBatch = batch
+                cachedSeqLen = seqLen
+            }
+            
+            return (cachedExpandedHMask, cachedExpandedWMask)
+        }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
-            let freqs_t = freqs[0, 0..., 0..., 0...]  // (bs, seq_len, head_dim // 2)
+            let startTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                ProfilingStats.applyInterleavedMRopeTime += elapsed
+                ProfilingStats.applyInterleavedMRopeCount += 1
+            }
+            
+            // Python: freqs_t = freqs[0]; freqs_t[..., idx] = freqs[dim, ..., idx]
+            // Use cached masks to avoid recomputing them every time
+            var freqs_t = freqs[0, 0..., 0..., 0...]  // (bs, seq_len, head_dim // 2)
 
             let dims = freqs_t.dim(-1)
-            var slices: [MLXArray] = []
-
-            for idx in 0 ..< dims {
-                var slice = freqs_t[0..., 0..., idx]
-
-                for (dimIndex, offset) in [(1, 1), (2, 2)] {
-                    let end = min(mropeSection[dimIndex] * 3, dims)
-                    if idx >= offset && idx < end && (idx - offset) % 3 == 0 {
-                        slice = freqs[dimIndex, 0..., 0..., idx]
-                        break
-                    }
-                }
-
-                slices.append(slice)
+            let batch = freqs_t.dim(0)
+            let seqLen = freqs_t.dim(1)
+            
+            // Get cached masks (only recompute if dimensions changed)
+            let (hMaskExpanded, wMaskExpanded) = getMasks(dims: dims, batch: batch, seqLen: seqLen)
+            
+            // Apply h mask if present
+            if let hMaskExpanded = hMaskExpanded {
+                let freqs_h = freqs[1, 0..., 0..., 0...]
+                freqs_t = `where`(hMaskExpanded, freqs_h, freqs_t)
+            }
+            
+            // Apply w mask if present
+            if let wMaskExpanded = wMaskExpanded {
+                let freqs_w = freqs[2, 0..., 0..., 0...]
+                freqs_t = `where`(wMaskExpanded, freqs_w, freqs_t)
             }
 
-            return stacked(slices, axis: -1)
+            return freqs_t
         }
 
         func callAsFunction(positionIds: MLXArray, dtype: MLX.DType) -> (MLXArray, MLXArray) {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                ProfilingStats.rotaryEmbeddingTime += elapsed
+                ProfilingStats.rotaryEmbeddingCount += 1
+            }
+            
             var positionIds = positionIds
             if positionIds.ndim == 2 {
                 positionIds = positionIds[.newAxis, 0..., 0...]
@@ -1225,6 +1381,13 @@ enum Qwen3VLLanguage {
             cache: KVCache?,
             positionIds: MLXArray?
         ) -> MLXArray {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                ProfilingStats.attentionTime += elapsed
+                ProfilingStats.attentionCount += 1
+            }
+            
             let (batch, length) = (x.dim(0), x.dim(1))
 
             var queries = wq(x)
@@ -1456,6 +1619,13 @@ enum Qwen3VLLanguage {
             imageGridTHW: [THW]?,
             videoGridTHW: [THW]?
         ) -> LMOutput {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                ProfilingStats.languageModelTime += elapsed
+                ProfilingStats.languageModelCount += 1
+            }
+            
             if pixelValues != nil {
                 ropeDeltas = nil
             }
@@ -1463,6 +1633,13 @@ enum Qwen3VLLanguage {
             var positionIds = providedPositionIds
 
             if positionIds == nil && (mask == nil || mask?.ndim == 2) {
+                let posIDStartTime = CFAbsoluteTimeGetCurrent()
+                defer {
+                    let elapsed = CFAbsoluteTimeGetCurrent() - posIDStartTime
+                    ProfilingStats.positionIDTime += elapsed
+                    ProfilingStats.positionIDCount += 1
+                }
+                
                 if (cache?.first?.offset ?? 0) == 0 || ropeDeltas == nil || cache == nil {
                     if let inputIds {
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
@@ -1513,6 +1690,13 @@ enum Qwen3VLLanguage {
                 }
             }
 
+            let modelStartTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - modelStartTime
+                ProfilingStats.modelForwardTime += elapsed
+                ProfilingStats.modelForwardCount += 1
+            }
+            
             var output = model(
                 inputIds,
                 cache: cache,
@@ -1522,11 +1706,15 @@ enum Qwen3VLLanguage {
                 visualMask: visualMask,
                 deepstackEmbeds: deepstackEmbeds)
 
+            let lmHeadStartTime = CFAbsoluteTimeGetCurrent()
             if let lmHead {
                 output = lmHead(output)
             } else {
                 output = model.embedTokens.asLinear(output)
             }
+            let lmHeadElapsed = CFAbsoluteTimeGetCurrent() - lmHeadStartTime
+            ProfilingStats.lmHeadTime += lmHeadElapsed
+            ProfilingStats.lmHeadCount += 1
 
             return LMOutput(logits: output)
         }
