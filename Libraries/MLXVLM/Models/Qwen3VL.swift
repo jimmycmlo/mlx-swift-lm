@@ -13,8 +13,6 @@ import Tokenizers
 // MARK: - Profiling
 
 private struct ProfilingStats {
-    static var applyInterleavedMRopeTime: Double = 0
-    static var applyInterleavedMRopeCount: Int = 0
     static var rotaryEmbeddingTime: Double = 0
     static var rotaryEmbeddingCount: Int = 0
     static var positionIDTime: Double = 0
@@ -29,8 +27,6 @@ private struct ProfilingStats {
     static var lmHeadCount: Int = 0
     
     static func reset() {
-        applyInterleavedMRopeTime = 0
-        applyInterleavedMRopeCount = 0
         rotaryEmbeddingTime = 0
         rotaryEmbeddingCount = 0
         positionIDTime = 0
@@ -47,10 +43,6 @@ private struct ProfilingStats {
     
     static func printStats() {
         print("\n=== Qwen3VL Profiling Stats ===")
-        if applyInterleavedMRopeCount > 0 {
-            let avg = applyInterleavedMRopeTime * 1000 / Double(applyInterleavedMRopeCount)
-            print("applyInterleavedMRope: \(String(format: "%.2f", applyInterleavedMRopeTime * 1000))ms total, \(applyInterleavedMRopeCount) calls, \(String(format: "%.2f", avg))ms avg")
-        }
         if rotaryEmbeddingCount > 0 {
             let avg = rotaryEmbeddingTime * 1000 / Double(rotaryEmbeddingCount)
             print("rotaryEmbedding: \(String(format: "%.2f", rotaryEmbeddingTime * 1000))ms total, \(rotaryEmbeddingCount) calls, \(String(format: "%.2f", avg))ms avg")
@@ -75,7 +67,9 @@ private struct ProfilingStats {
             let avg = lmHeadTime * 1000 / Double(lmHeadCount)
             print("lmHead: \(String(format: "%.2f", lmHeadTime * 1000))ms total, \(lmHeadCount) calls, \(String(format: "%.2f", avg))ms avg")
         }
-        let totalTime = applyInterleavedMRopeTime + rotaryEmbeddingTime + positionIDTime + attentionTime + modelForwardTime + languageModelTime + lmHeadTime
+        // Total time is languageModelTime (which includes all nested operations)
+        // Don't sum nested times to avoid double-counting
+        let totalTime = languageModelTime
         print("Total tracked time: \(String(format: "%.2f", totalTime * 1000))ms")
         print("==============================\n")
     }
@@ -1265,13 +1259,6 @@ enum Qwen3VLLanguage {
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
-            let startTime = CFAbsoluteTimeGetCurrent()
-            defer {
-                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-                ProfilingStats.applyInterleavedMRopeTime += elapsed
-                ProfilingStats.applyInterleavedMRopeCount += 1
-            }
-            
             // Python: freqs_t = freqs[0]; freqs_t[..., idx] = freqs[dim, ..., idx]
             // Use cached masks to avoid recomputing them every time
             var freqs_t = freqs[0, 0..., 0..., 0...]  // (bs, seq_len, head_dim // 2)

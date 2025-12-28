@@ -11,6 +11,63 @@ import MLXLMCommon
 import MLXNN
 import Tokenizers
 
+// MARK: - Profiling
+
+private struct Qwen2VLProfilingStats {
+    static var attentionTime: Double = 0
+    static var attentionCount: Int = 0
+    static var rotaryEmbeddingTime: Double = 0
+    static var rotaryEmbeddingCount: Int = 0
+    static var modelForwardTime: Double = 0
+    static var modelForwardCount: Int = 0
+    static var languageModelTime: Double = 0
+    static var languageModelCount: Int = 0
+    static var lmHeadTime: Double = 0
+    static var lmHeadCount: Int = 0
+    
+    static func reset() {
+        attentionTime = 0
+        attentionCount = 0
+        rotaryEmbeddingTime = 0
+        rotaryEmbeddingCount = 0
+        modelForwardTime = 0
+        modelForwardCount = 0
+        languageModelTime = 0
+        languageModelCount = 0
+        lmHeadTime = 0
+        lmHeadCount = 0
+    }
+    
+    static func printStats() {
+        print("\n=== Qwen2VL Profiling Stats ===")
+        if rotaryEmbeddingCount > 0 {
+            let avg = rotaryEmbeddingTime * 1000 / Double(rotaryEmbeddingCount)
+            print("rotaryEmbedding: \(String(format: "%.2f", rotaryEmbeddingTime * 1000))ms total, \(rotaryEmbeddingCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if attentionCount > 0 {
+            let avg = attentionTime * 1000 / Double(attentionCount)
+            print("attention: \(String(format: "%.2f", attentionTime * 1000))ms total, \(attentionCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if modelForwardCount > 0 {
+            let avg = modelForwardTime * 1000 / Double(modelForwardCount)
+            print("model forward: \(String(format: "%.2f", modelForwardTime * 1000))ms total, \(modelForwardCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if languageModelCount > 0 {
+            let avg = languageModelTime * 1000 / Double(languageModelCount)
+            print("languageModel.callAsFunction: \(String(format: "%.2f", languageModelTime * 1000))ms total, \(languageModelCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        if lmHeadCount > 0 {
+            let avg = lmHeadTime * 1000 / Double(lmHeadCount)
+            print("lmHead: \(String(format: "%.2f", lmHeadTime * 1000))ms total, \(lmHeadCount) calls, \(String(format: "%.2f", avg))ms avg")
+        }
+        // Total time is languageModelTime (which includes all nested operations)
+        // Don't sum nested times to avoid double-counting
+        let totalTime = languageModelTime
+        print("Total tracked time: \(String(format: "%.2f", totalTime * 1000))ms")
+        print("==============================\n")
+    }
+}
+
 // MARK: - Language
 
 private enum Language {
@@ -91,6 +148,13 @@ private enum Language {
         public func callAsFunction(
             _ x: MLXArray, mask: MLXArray? = nil, cache: KVCache?
         ) -> MLXArray {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                Qwen2VLProfilingStats.attentionTime += elapsed
+                Qwen2VLProfilingStats.attentionCount += 1
+            }
+            
             let (B, L) = (x.dim(0), x.dim(1))
 
             var queries = wq(x)
@@ -103,8 +167,13 @@ private enum Language {
             values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
 
             let offset = cache?.offset ?? 0
+            
+            let rotaryStartTime = CFAbsoluteTimeGetCurrent()
             queries = rotaryEmbedding(queries, offset: offset)
             keys = rotaryEmbedding(keys, offset: offset)
+            let rotaryElapsed = CFAbsoluteTimeGetCurrent() - rotaryStartTime
+            Qwen2VLProfilingStats.rotaryEmbeddingTime += rotaryElapsed
+            Qwen2VLProfilingStats.rotaryEmbeddingCount += 2  // Two calls
 
             let maskConverted: MLXFast.ScaledDotProductAttentionMaskMode =
                 if let mask {
@@ -196,6 +265,13 @@ private enum Language {
         public func callAsFunction(
             _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
         ) -> MLXArray {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                Qwen2VLProfilingStats.modelForwardTime += elapsed
+                Qwen2VLProfilingStats.modelForwardCount += 1
+            }
+            
             var h: MLXArray
             if let inputEmbedding {
                 h = inputEmbedding
@@ -234,12 +310,25 @@ private enum Language {
         public func callAsFunction(
             _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
         ) -> LMOutput {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            defer {
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                Qwen2VLProfilingStats.languageModelTime += elapsed
+                Qwen2VLProfilingStats.languageModelCount += 1
+            }
+            
             var out = model(inputs, cache: cache, inputEmbedding: inputEmbedding)
+            
+            let lmHeadStartTime = CFAbsoluteTimeGetCurrent()
             if let lmHead {
                 out = lmHead(out)
             } else {
                 out = model.embedTokens.asLinear(out)
             }
+            let lmHeadElapsed = CFAbsoluteTimeGetCurrent() - lmHeadStartTime
+            Qwen2VLProfilingStats.lmHeadTime += lmHeadElapsed
+            Qwen2VLProfilingStats.lmHeadCount += 1
+            
             return LMOutput(logits: out)
         }
     }
@@ -1888,6 +1977,17 @@ public struct Qwen2VLProcessorConfiguration: Codable, Sendable {
         case _maxFrames = "max_frames"
         case _fps = "fps"
         case _size = "size"
+    }
+}
+
+// Public API for profiling
+public extension Qwen2VL {
+    static func printProfilingStats() {
+        Qwen2VLProfilingStats.printStats()
+    }
+    
+    static func resetProfilingStats() {
+        Qwen2VLProfilingStats.reset()
     }
 }
 
