@@ -59,7 +59,9 @@ private struct Qwen25VLProfilingStats {
             let avg = lmHeadTime * 1000 / Double(lmHeadCount)
             print("lmHead: \(String(format: "%.2f", lmHeadTime * 1000))ms total, \(lmHeadCount) calls, \(String(format: "%.2f", avg))ms avg")
         }
-        let totalTime = rotaryEmbeddingTime + attentionTime + modelForwardTime + languageModelTime + lmHeadTime
+        // Total time is languageModelTime (which includes all nested operations)
+        // Don't sum nested times to avoid double-counting
+        let totalTime = languageModelTime
         print("Total tracked time: \(String(format: "%.2f", totalTime * 1000))ms")
         print("==============================\n")
     }
