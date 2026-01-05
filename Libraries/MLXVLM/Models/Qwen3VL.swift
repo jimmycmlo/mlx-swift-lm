@@ -958,7 +958,7 @@ enum Qwen3VLVision {
                 var blockCols = MLXArray(0 ..< mergedW).asType(.int32)
                 blockCols = blockCols.reshaped([1, mergedW, 1, 1])
 
-                var intra = MLXArray(0 ..< merge).asType(.int32)
+                let intra = MLXArray(0 ..< merge).asType(.int32)
                 let intraRow = intra.reshaped([1, 1, merge, 1])
                 let intraCol = intra.reshaped([1, 1, 1, merge])
 
@@ -1305,7 +1305,7 @@ enum Qwen3VLLanguage {
             var freqs = pos[0..., 0..., 0..., .newAxis] * invFreq
             freqs = applyInterleavedMRope(freqs)
 
-            var emb = concatenated([freqs, freqs], axis: -1)
+            let emb = concatenated([freqs, freqs], axis: -1)
             let cosValues = cos(emb).asType(dtype)
             let sinValues = sin(emb).asType(dtype)
             return (cosValues, sinValues)
@@ -1550,7 +1550,7 @@ enum Qwen3VLLanguage {
 
             let indexArray = MLXArray(indices.map { UInt32($0) })
 
-            var result = hiddenStates
+            let result = hiddenStates
             result[0..., indexArray, 0...] = result[0..., indexArray, 0...] + visualEmbeds
 
             return result
@@ -2005,7 +2005,6 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         windowSize _: Int?
     ) throws -> PrepareResult {
         let inputIds = input.text.tokens
-        let inputMask = input.text.mask
 
         var pixelValues: MLXArray?
         var imageFrames: [THW]? = nil
@@ -2027,8 +2026,6 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
         if !pixelParts.isEmpty {
             pixelValues = concatenated(pixelParts)
-            if let pixelValues {
-            }
         }
 
         var inputEmbeddings: MLXArray? = nil
@@ -2883,8 +2880,6 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
         let typedCache = castCacheOptional(cache)
 
-        let offset = cache?.first?.offset ?? 0
-
         let result = languageModel(
             inputs,
             cache: typedCache,
@@ -2950,7 +2945,7 @@ extension Qwen3VL {
 public struct Qwen3VLMessageGenerator: MessageGenerator {
     public init() {}
 
-    public func generate(message: Chat.Message) -> Message {
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
         let imageContent = message.images.map { _ in
             ["type": "image"]
         }

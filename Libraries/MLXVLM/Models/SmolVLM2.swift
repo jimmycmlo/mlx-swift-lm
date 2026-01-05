@@ -5,7 +5,6 @@
 //  Created by Pedro Cuenca on 20/3/25.
 //
 
-import AVFoundation
 import CoreImage
 import CoreMedia
 import Foundation
@@ -13,67 +12,10 @@ import MLX
 import MLXLMCommon
 import Tokenizers
 
-// MARK: - SmolVLM2 with FrameSpecification Support
-//
-// SmolVLM2 now supports selective video frame processing through the FrameSpecification enum.
-// This allows you to process only specific frames from a video, which can be useful for:
-// - Reducing processing time for long videos
-// - Focusing on key moments or scenes
-// - Analyzing specific timestamps or frame numbers
-//
-// Example usage:
-// ```swift
-// let processor = SmolVLMProcessor(config, tokenizer: tokenizer)
-// 
-// // Process all frames (default behavior)
-// let allFramesInput = try await processor.prepare(input: userInput)
-// 
-// // Process specific frame numbers (0-based indexing)
-// let specificFramesInput = try await processor.prepare(
-//     input: userInput, 
-//     frameSpecification: .frameNumbers([0, 10, 20, 30])
-// )
-// 
-// // Process frames at specific timestamps (in seconds)
-// let timestampFramesInput = try await processor.prepare(
-//     input: userInput, 
-//     frameSpecification: .timestamps([0.0, 5.0, 10.0, 15.0])
-// )
-// 
-// // Process all frames explicitly
-// let allFramesInput = try await processor.prepare(
-//     input: userInput, 
-//     frameSpecification: .allFrames
-// )
-// ```
-//
-// FrameSpecification options:
-// - `.allFrames`: Process all frames in the video (default behavior)
-// - `.frameNumbers([Int])`: Process specific frame numbers (0-based indexing)
-// - `.timestamps([TimeInterval])`: Process frames at specific timestamps (in seconds)
-//
-// Notes:
-// - Frame numbers are validated against video duration and FPS
-// - Timestamps are validated against video duration
-// - Invalid frame numbers or timestamps are automatically filtered out
-// - The processor will log which frames are being processed for debugging
-
 // MARK: - Configuration and modeling are Idefics3
 
 typealias SmolVLM2Configuration = Idefics3Configuration
 typealias SmolVLM2 = Idefics3
-
-// MARK: - Frame Specification
-
-/// Frame specification for selective video processing
-public enum FrameSpecification {
-    /// Process specific frame numbers (0-based indexing)
-    case frameNumbers([Int])
-    /// Process frames at specific timestamps (in seconds)
-    case timestamps([TimeInterval])
-    /// Process all frames (default behavior)
-    case allFrames
-}
 
 // MARK: - SmolVLMProcessor and configuration
 
@@ -103,35 +45,12 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
     public let maxImageSize: Size
     public let videoSampling: VideoSampling
     private let _imageSequenceLength: Int?
-    
-    // Additional configuration properties for video processing
-    private var _maxFrames: Int?
-    private var _fps: Double?
-    
     // TODO: this does not come in preprocessor_config.json, verify where transformers gets it from
     public var imageSequenceLength: Int { _imageSequenceLength ?? 64 }
-    
-    public var maxFrames: Int {
-        get {
-            _maxFrames ?? videoSampling.maxFrames
-        }
-        set {
-            _maxFrames = newValue
-        }
-    }
-    
-    public var fps: Double {
-        get {
-            _fps ?? Double(videoSampling.fps)
-        }
-        set {
-            _fps = newValue
-        }
-    }
 
     init(
         imageMean: [CGFloat], imageStd: [CGFloat], size: Size, maxImageSize: Size,
-        videoSampling: VideoSampling, imageSequenceLength: Int?, maxFrames: Int? = nil, fps: Double? = nil
+        videoSampling: VideoSampling, imageSequenceLength: Int?
     ) {
         self.imageMean = imageMean
         self.imageStd = imageStd
@@ -139,8 +58,6 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
         self.maxImageSize = maxImageSize
         self.videoSampling = videoSampling
         self._imageSequenceLength = imageSequenceLength
-        self._maxFrames = maxFrames
-        self._fps = fps
     }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
@@ -157,13 +74,11 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
         case maxImageSize = "max_image_size"
         case videoSampling = "video_sampling"
         case _imageSequenceLength = "image_seq_len"
-        case _maxFrames = "max_frames"
-        case _fps = "fps"
     }
 }
 
 public class SmolVLMProcessor: UserInputProcessor {
-    public var config: SmolVLMProcessorConfiguration
+    private let config: SmolVLMProcessorConfiguration
     private let tokenizer: any Tokenizer
 
     // FIXME: hardcoded values for now
@@ -177,9 +92,9 @@ public class SmolVLMProcessor: UserInputProcessor {
     var maxProcessingImageSize: CGFloat { CGFloat(config.size.longestEdge) }  // 2048
     var fixedImageSize: CGFloat { CGFloat(config.maxImageSize.longestEdge) }  // 384 for big models, 512 for small models (200-500M)
     var imageSequenceLength: Int { config.imageSequenceLength }
-    var maxVideoFrames: Int { config.maxFrames }
-    var targetVideoFPS: Double { config.fps }
-    
+    var maxVideoFrames: Int { 20 /*config.videoSampling.maxFrames*/ }
+    var targetVideoFPS: Double { Double(config.videoSampling.fps) }
+
     let defaultVideoSystemMessage =
         "You are a helpful assistant that can understand videos. Describe what type of video this is and what's happening in it."
 
@@ -189,14 +104,6 @@ public class SmolVLMProcessor: UserInputProcessor {
     ) {
         self.config = config
         self.tokenizer = tokenizer
-        print("SmolVLM2 Configuration:")
-        print("  maxProcessingImageSize: \(maxProcessingImageSize)")
-        print("  fixedImageSize: \(fixedImageSize)")
-        print("  imageSequenceLength: \(imageSequenceLength)")
-        print("  maxVideoFrames: \(maxVideoFrames)")
-        print("  targetVideoFPS: \(targetVideoFPS)")
-        print("  config.maxFrames: \(config.maxFrames)")
-        print("  config.fps: \(config.fps)")
     }
 
     func getVideoPromptString(
@@ -247,7 +154,7 @@ public class SmolVLMProcessor: UserInputProcessor {
     /// If `multiple` is not nil, ensures each side is a multiple of that value
     func aspectRatioSize(for size: CGSize, longestEdge: CGFloat, multiple: CGFloat? = nil) -> CGSize
     {
-        var targetSize = MediaProcessing.bestFit(
+        let targetSize = MediaProcessing.bestFit(
             size, in: CGSize(width: longestEdge, height: longestEdge))
         guard let multiple = multiple else { return targetSize }
         let aspectRatio = targetSize.width / targetSize.height
@@ -314,20 +221,6 @@ public class SmolVLMProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        // Default to processing all frames
-        return try await prepare(input: input, frameSpecification: .allFrames)
-    }
-    
-    /// Prepare input with specific frame specification for selective video processing
-    /// - Parameters:
-    ///   - input: The user input containing text, images, and/or videos
-    ///   - frameSpecification: The frame specification for video processing
-    /// - Returns: Prepared LMInput ready for model inference
-    public func prepareWithFrameSpecification(input: UserInput, frameSpecification: FrameSpecification) async throws -> LMInput {
-        return try await prepare(input: input, frameSpecification: frameSpecification)
-    }
-    
-    public func prepare(input: UserInput, frameSpecification: FrameSpecification) async throws -> LMInput {
         let messages = Qwen2VLMessageGenerator().generate(from: input)  // TODO: Create SmolVLM2MessageGenerator
 
         if input.images.isEmpty && input.videos.isEmpty {
@@ -344,7 +237,7 @@ public class SmolVLMProcessor: UserInputProcessor {
 
             // Unfortunately we don't have a "render" option in Tokenizers yet, so decoding
             let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
-            let decoded = try tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
+            let decoded = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
 
             let image = try input.images[0].asCIImage().toSRGB()
             let (tiles, imageRows, imageCols) = tiles(from: image)
@@ -375,7 +268,7 @@ public class SmolVLMProcessor: UserInputProcessor {
             )
 
             let prompt = decoded.replacingOccurrences(of: imageToken, with: imagePromptString)
-            let finalPromptTokens = try tokenizer.encode(text: prompt)
+            let finalPromptTokens = tokenizer.encode(text: prompt)
 
             let promptArray = MLXArray(finalPromptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray)
@@ -394,8 +287,8 @@ public class SmolVLMProcessor: UserInputProcessor {
             }
 
             // Insert a default system message if the input doesn't have one
-            func messagesWithSystem(_ messages: [Message]) -> [Message] {
-                guard messages.filter { $0["role"] as? String == "system" }.isEmpty else {
+            func messagesWithSystem(_ messages: [MLXLMCommon.Message]) -> [MLXLMCommon.Message] {
+                guard messages.filter({ $0["role"] as? String == "system" }).isEmpty else {
                     return messages
                 }
 
@@ -409,137 +302,27 @@ public class SmolVLMProcessor: UserInputProcessor {
             }
 
             // Unfortunately we don't have a "render" option in Tokenizers yet, so decoding
-            let finalMessages = messagesWithSystem(messages)
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messagesWithSystem(messages))
-            let decoded = try tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
+            let decoded = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
 
-            var video = try input.videos[0].asAVAsset()
+            let video = input.videos[0].asAVAsset()
 
-            // Handle frame specification for selective video processing
-            let processedFrames: ProcessedFrames
-            switch frameSpecification {
-            case .allFrames:
-                print("SmolVLM2: Using ALL FRAMES processing mode")
-                // Process all frames as before
-                var frameCounter = 0
-                processedFrames = await try MediaProcessing.asProcessedSequence(
-                    video,
-                    maxFrames: maxVideoFrames,
-                    targetFPS: { duration in
-                        // 1 fps for duration >= 10s, apply a multiplier if smaller
-                        max((10 - 0.9 * duration.seconds) * targetVideoFPS, 1)
-                    }
-                ) { frame in
-                    // Log frame information
-                    let timestamp = frame.timeStamp
-                    let size = frame.frame.extent.size
-//                    print("SmolVLM2: Processing frame \(frameCounter) at \(formatTimestamp(timestamp)) (size: \(Int(size.width))x\(Int(size.height)))")
-                    frameCounter += 1
-                    
-                    let processedFrame = frame.frame
-                        .toSRGB()
-                        .resampled(
-                            to: CGSize(width: fixedImageSize, height: fixedImageSize), method: .lanczos
-                        )
-                        .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
-                    print("SmolVLM2: Processing frame \(frameCounter) at \(formatTimestamp(timestamp)) (size: \(Int(fixedImageSize))x\(Int(fixedImageSize)))")
-                    return VideoFrame(frame: processedFrame, timeStamp: frame.timeStamp)
+            let processedFrames = try await MediaProcessing.asProcessedSequence(
+                video,
+                maxFrames: maxVideoFrames,
+                targetFPS: { duration in
+                    // 1 fps for duration >= 10s, apply a multiplier if smaller
+                    max((10 - 0.9 * duration.seconds) * targetVideoFPS, 1)
                 }
-                
-            case .frameNumbers(let frameNumbers):
-                print("SmolVLM2: Using FRAME NUMBERS processing mode")
-                // Process specific frame numbers
-                let sortedFrameNumbers = frameNumbers.sorted()
-                let duration = try await video.load(.duration)
-                let durationSeconds = CMTimeGetSeconds(duration)
-                let maxFrameNumber = Int(durationSeconds * targetVideoFPS)
-                
-                let validFrames = sortedFrameNumbers.filter { $0 >= 0 && $0 < maxFrameNumber }
-                print("SmolVLM2: Processing specific frame numbers: \(validFrames)")
-                
-                var selectedFrames: [MLXArray] = []
-                var selectedTimestamps: [CMTime] = []
-                
-                for frameNumber in validFrames {
-                    let timestamp = TimeInterval(frameNumber) / targetVideoFPS
-                    let time = CMTime(seconds: timestamp, preferredTimescale: 600)
-                    
-                    // Extract frame using AVAssetImageGenerator
-                    let generator = AVAssetImageGenerator(asset: video)
-                    generator.appliesPreferredTrackTransform = true
-                    generator.requestedTimeToleranceBefore = .zero
-                    generator.requestedTimeToleranceAfter = .zero
-                    
-                    let cgImage = try await generator.image(at: time).image
-                    let frameImage = CIImage(cgImage: cgImage, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
-                    
-                    // Log frame information
-                    let size = frameImage.extent.size
-                    print("SmolVLM2: Processing frame \(frameNumber) at \(formatTimestamp(time)) (size: \(Int(size.width))x\(Int(size.height)))")
-                    
-                    let processedFrame = frameImage
-                        .toSRGB()
-                        .resampled(
-                            to: CGSize(width: fixedImageSize, height: fixedImageSize), method: .lanczos
-                        )
-                        .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
-                    
-                    selectedFrames.append(processedFrame.asMLXArray())
-                    selectedTimestamps.append(time)
-                }
-                
-                processedFrames = ProcessedFrames(
-                    frames: selectedFrames,
-                    timestamps: selectedTimestamps,
-                    totalDuration: duration
-                )
-                
-            case .timestamps(let timestamps):
-                print("SmolVLM2: Using TIMESTAMPS processing mode")
-                // Process frames at specific timestamps
-                let sortedTimestamps = timestamps.sorted()
-                let duration = try await video.load(.duration)
-                let durationSeconds = CMTimeGetSeconds(duration)
-                
-                let validTimestamps = sortedTimestamps.filter { $0 >= 0 && $0 <= durationSeconds }
-                print("SmolVLM2: Processing frames at timestamps: \(validTimestamps.map { String(format: "%.2f", $0) })")
-                
-                var selectedFrames: [MLXArray] = []
-                var selectedTimestamps: [CMTime] = []
-                
-                for (index, timestamp) in validTimestamps.enumerated() {
-                    let time = CMTime(seconds: timestamp, preferredTimescale: 600)
-                    
-                    // Extract frame using AVAssetImageGenerator
-                    let generator = AVAssetImageGenerator(asset: video)
-                    generator.appliesPreferredTrackTransform = true
-                    generator.requestedTimeToleranceBefore = .zero
-                    generator.requestedTimeToleranceAfter = .zero
-                    
-                    let cgImage = try await generator.image(at: time).image
-                    let frameImage = CIImage(cgImage: cgImage, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
-                    
-                    // Log frame information
-                    let size = frameImage.extent.size
-                    print("SmolVLM2: Processing frame \(index) at \(formatTimestamp(time)) (size: \(Int(size.width))x\(Int(size.height)))")
-                    
-                    let processedFrame = frameImage
-                        .toSRGB()
-                        .resampled(
-                            to: CGSize(width: fixedImageSize, height: fixedImageSize), method: .lanczos
-                        )
-                        .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
-                    
-                    selectedFrames.append(processedFrame.asMLXArray())
-                    selectedTimestamps.append(time)
-                }
-                
-                processedFrames = ProcessedFrames(
-                    frames: selectedFrames,
-                    timestamps: selectedTimestamps,
-                    totalDuration: duration
-                )
+            ) { frame in
+                let processedFrame = frame.frame
+                    .toSRGB()
+                    .resampled(
+                        to: CGSize(width: fixedImageSize, height: fixedImageSize), method: .lanczos
+                    )
+                    .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
+                return VideoFrame(frame: processedFrame, timeStamp: frame.timeStamp)
             }
 
             let thwFrames = (0 ..< processedFrames.frames.count).map {
@@ -566,7 +349,7 @@ public class SmolVLMProcessor: UserInputProcessor {
                 // Fallback if the expected marker is not present
                 prompt = decoded + "\n" + videoPromptString
             }
-            let finalPromptTokens = try tokenizer.encode(text: prompt)
+            let finalPromptTokens = tokenizer.encode(text: prompt)
 
             let promptArray = MLXArray(finalPromptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray)

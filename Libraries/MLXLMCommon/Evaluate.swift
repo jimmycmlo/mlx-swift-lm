@@ -8,7 +8,7 @@ import Tokenizers
 /// a ``LanguageModel`` to produce a token.
 ///
 /// See also: ``LogitProcessor``
-public protocol LogitSampler: Sendable {
+public protocol LogitSampler {
 
     /// Given `logits` produce a new `MLXArray` with the token.
     func sample(logits: MLXArray) -> MLXArray
@@ -36,7 +36,7 @@ public protocol LogitProcessor: Sendable {
     /// called before token generation starts with the text tokens of the prompt
     mutating func prompt(_ prompt: MLXArray)
 
-    /// called to visit ad possibly modify the logits
+    /// called to visit and possibly modify the logits
     func process(logits: MLXArray) -> MLXArray
 
     /// called to provide the sampled token
@@ -173,7 +173,7 @@ public struct TopPSampler: LogitSampler {
     }
 }
 
-/// Processor that uses `temperature` to sample the logits
+/// Sampler that uses `temperature` to sample the logits.
 public struct CategoricalSampler: LogitSampler {
     let temp: MLXArray
     let randomState: MLXRandom.RandomState
@@ -195,7 +195,7 @@ public struct RepetitionContext: LogitProcessor {
     /// tokens in the repetition context sliding window
     var tokens = [Int]()
 
-    /// current write into into the tokens circular array
+    /// current write index into the tokens circular array
     var index = 0
 
     /// penalty factor for repeating tokens
@@ -246,7 +246,7 @@ public struct RepetitionContext: LogitProcessor {
 
 /// Generator of tokens.
 ///
-/// This is typically used via a call to ``generate(input:parameters:context:didGenerate:)``.
+/// This is typically used via a call to ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>`.
 ///
 /// To use it directly:
 ///
@@ -255,7 +255,7 @@ public struct RepetitionContext: LogitProcessor {
 /// let input: LMInput
 /// let model: LanguageModel
 ///
-/// let iterator = try TokenIterator(input: input, model: model, parameters: parameters)
+/// let iterator = try TokenIterator(input: input, model: model, parameters: generateParameters)
 ///
 /// for token in iterator {
 ///     ...
@@ -452,8 +452,8 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     }
 }
 
-/// Result of a call to ``generate(input:parameters:context:didGenerate:)``.
-public struct GenerateResult: Sendable {
+/// Result of a call to a deprecated callback-based generate function.
+public struct GenerateResult {
 
     /// Initializes a new `GenerateResult` instance.
     ///
@@ -518,7 +518,7 @@ public struct GenerateResult: Sendable {
     }
 }
 
-/// Action from token visitor callback in ``generate(input:parameters:context:didGenerate:)``.
+/// Action from token visitor callback in deprecated callback-based generate functions.
 public enum GenerateDisposition: Sendable {
     /// keep producing tokens until an EOS token is produced
     case more
@@ -529,16 +529,20 @@ public enum GenerateDisposition: Sendable {
 
 /// Given prompt tokens generate text using the given model and parameters.
 ///
-/// ``generate(input:parameters:context:didGenerate:)`` is the preferred call.
+/// ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>` is the preferred call.
 ///
 /// - Parameters:
 ///   - promptTokens: tokenized prompt
 ///   - parameters: generation parameters
 ///   - model: model to evaluate
-///   - tokenizer: tokenizer to convert tokens back into strings and recognizer special tokens
+///   - tokenizer: tokenizer to convert tokens back into strings and recognize special tokens
 ///   - extraEOSTokens: any additional stop tokens
 ///   - didGenerate: visitor for the tokens as they are generated
-@available(*, deprecated, message: "please use generate(input:parameters:context:didGenerate:)")
+@available(
+    *, deprecated,
+    message:
+        "Use the AsyncStream-based generate(input:cache:parameters:context:) instead for better Swift concurrency support"
+)
 public func generate(
     promptTokens: [Int], parameters: GenerateParameters, model: any LanguageModel,
     tokenizer: Tokenizer,
@@ -563,23 +567,7 @@ public func generate(
 
 /// Generate tokens from an ``LMInput`` and a ``ModelContext``.
 ///
-/// For example:
-///
-/// ```swift
-/// let generateParameters: GenerateParameters
-/// let input: UserInput
-/// let context: ModelContext
-///
-/// let lmInput = try context.processor.prepare(input: input)
-/// let result = generate(input: lmInput,
-///     parameters: generateParameters,
-///     context: context) { tokens in
-///     .more
-/// }
-/// ```
-///
-/// Internally this constructs a ``TokenIterator`` and calls
-/// ``generate(input:context:iterator:didGenerate:)``
+/// Prefer using ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>` instead.
 ///
 /// - Parameters:
 ///   - input: prepared language model input
@@ -587,6 +575,11 @@ public func generate(
 ///   - context: model context (model and tokenizer)
 ///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
 /// - Returns: the generated output
+@available(
+    *, deprecated,
+    message:
+        "Use the AsyncStream-based generate(input:cache:parameters:context:) instead for better Swift concurrency support"
+)
 public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
     didGenerate: ([Int]) -> GenerateDisposition
@@ -597,9 +590,9 @@ public func generate(
         input: input, context: context, iterator: iterator, didGenerate: didGenerate)
 }
 
-/// Low level token generation using a ``TokenIterator``.
+/// Low-level token generation using a ``TokenIterator``.
 ///
-/// ``generate(input:parameters:context:didGenerate:)`` is the preferred call.
+/// ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>` is the preferred call.
 ///
 /// - Parameters:
 ///   - input: prepared language model input
@@ -607,6 +600,11 @@ public func generate(
 ///   - iterator: token iterator
 ///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
 /// - Returns: the generated output
+@available(
+    *, deprecated,
+    message:
+        "Use the AsyncStream-based generate(input:cache:parameters:context:) instead for better Swift concurrency support"
+)
 public func generate(
     input: LMInput, context: ModelContext,
     iterator: TokenIterator,
@@ -616,7 +614,7 @@ public func generate(
     var promptTime: TimeInterval = 0
 
     let additionalEOSTokenIds = Set(
-        (context.configuration.extraEOSTokens ?? [])
+        (context.configuration.extraEOSTokens)
             .compactMap {
                 context.tokenizer.convertTokenToId($0)
             })
@@ -662,23 +660,7 @@ public func generate(
 
 /// Generate tokens from an ``LMInput`` and a ``ModelContext``.
 ///
-/// For example:
-///
-/// ```swift
-/// let generateParameters: GenerateParameters
-/// let input: UserInput
-/// let context: ModelContext
-///
-/// let lmInput = try context.processor.prepare(input: input)
-/// let result = generate(input: lmInput,
-///     parameters: generateParameters,
-///     context: context) { token in
-///     .more
-/// }
-/// ```
-///
-/// Internally this constructs a ``TokenIterator`` and calls
-/// ``generate(input:context:iterator:didGenerate:)``
+/// Prefer using ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>` instead.
 ///
 /// - Parameters:
 ///   - input: prepared language model input
@@ -686,6 +668,11 @@ public func generate(
 ///   - context: model context (model and tokenizer)
 ///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
 /// - Returns: Information about the generation
+@available(
+    *, deprecated,
+    message:
+        "Use the AsyncStream-based generate(input:cache:parameters:context:) instead for better Swift concurrency support"
+)
 public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
     didGenerate: (Int) -> GenerateDisposition
@@ -696,6 +683,21 @@ public func generate(
         input: input, context: context, iterator: iterator, didGenerate: didGenerate)
 }
 
+/// Low-level token generation using a ``TokenIterator``.
+///
+/// ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>` is the preferred call.
+///
+/// - Parameters:
+///   - input: prepared language model input
+///   - context: model context (model and tokenizer)
+///   - iterator: token iterator
+///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
+/// - Returns: Information about the generation
+@available(
+    *, deprecated,
+    message:
+        "Use the AsyncStream-based generate(input:cache:parameters:context:) instead for better Swift concurrency support"
+)
 public func generate(
     input: LMInput, context: ModelContext,
     iterator: TokenIterator,
@@ -705,7 +707,7 @@ public func generate(
     var promptTime: TimeInterval = 0
 
     let additionalEOSTokenIds = Set(
-        (context.configuration.extraEOSTokens ?? [])
+        (context.configuration.extraEOSTokens)
             .compactMap {
                 context.tokenizer.convertTokenToId($0)
             })
@@ -753,7 +755,7 @@ public func generate(
 ///
 /// This function initializes a `TokenIterator` with the given input, model, and generation parameters,
 /// and then streams the token generation process via an `AsyncStream`. The resulting stream yields
-/// instances of the `Generation` enum, which can represent either individual tokens or summary
+/// instances of the `Generation` enum, which can represent text chunks, tool calls, or summary
 /// completion information.
 ///
 /// - Parameters:
@@ -761,8 +763,8 @@ public func generate(
 ///   - cache: optional ``KVCache``
 ///   - parameters: The configuration options for token generation.
 ///   - context: The model context, including the model itself and associated tokenizer.
-/// - Returns: An `AsyncStream` that emits `Generation` values, including generated tokens (`.token`)
-///   and completion information (`.info`).
+/// - Returns: An `AsyncStream` that emits `Generation` values, including generated text chunks (`.chunk`),
+///   tool calls (`.toolCall`), and completion information (`.info`).
 /// - Throws: An error if the `TokenIterator` initialization fails due to invalid input or model configuration.
 ///
 /// ### Example Usage:
@@ -775,15 +777,17 @@ public func generate(
 /// let lmInput = try context.processor.prepare(input: input)
 ///
 /// // Call the generate function to get an AsyncStream.
-/// let stream = try generate(input: lmInput, parameters: parameters, context: context)
+/// let stream = try generate(input: lmInput, parameters: generateParameters, context: context)
 ///
-/// // Process the stream asynchronously to handle generated tokens and completion info.
+/// // Process the stream asynchronously to handle text chunks and completion info.
 /// for await generation in stream {
 ///     switch generation {
-///     case .token(let token):
-///         print("Generated token: \(context.tokenizer.decode(tokens: [token])")
+///     case .chunk(let text):
+///         print("Generated text: \(text)")
 ///     case .info(let info):
 ///         print("Finished: \(info.tokensPerSecond) tokens/s.")
+///     case .toolCall(let call):
+///         print("Tool call: \(call.function.name)")
 ///     }
 /// }
 /// ```
@@ -796,85 +800,93 @@ public func generate(
         input: input, context: context, iterator: iterator)
 }
 
+/// Low-level token generation using a ``TokenIterator``, returning an `AsyncStream<Generation>`.
+///
+/// - Parameters:
+///   - input: prepared language model input
+///   - context: model context (model and tokenizer)
+///   - iterator: token iterator
+/// - Returns: An `AsyncStream` that emits `Generation` values
 public func generate(
     input: LMInput, context: ModelContext,
     iterator: TokenIterator
 ) -> AsyncStream<Generation> {
 
-    AsyncStream { continuation in
+    let (stream, continuation) = AsyncStream<Generation>.makeStream()
 
-        // Launch a Task to perform iteration asynchronously.
-        let task = Task {
-            var start = Date.timeIntervalSinceReferenceDate
-            var promptTime: TimeInterval = 0
+    // Launch a Task to perform iteration asynchronously.
+    let task = Task {
+        var start = Date.timeIntervalSinceReferenceDate
+        var promptTime: TimeInterval = 0
 
-            let additionalEOSTokenIds = Set(
-                context.configuration.extraEOSTokens
-                    .compactMap {
-                        context.tokenizer.convertTokenToId($0)
-                    })
+        let additionalEOSTokenIds = Set(
+            context.configuration.extraEOSTokens
+                .compactMap {
+                    context.tokenizer.convertTokenToId($0)
+                })
 
-            var tokenCount = 0
-            var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
-            let toolCallProcessor = ToolCallProcessor()
+        var tokenCount = 0
+        var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+        let toolCallProcessor = ToolCallProcessor()
 
-            for token in iterator {
+        for token in iterator {
 
-                // Check for cancellation on every loop iteration.
-                if Task.isCancelled { break }
+            // Check for cancellation on every loop iteration.
+            if Task.isCancelled { break }
 
-                if promptTime == 0 {
-                    let now = Date.timeIntervalSinceReferenceDate
-                    promptTime = now - start
-                    start = now
-                }
-
-                if token == context.tokenizer.unknownTokenId
-                    || token == context.tokenizer.eosTokenId
-                    || additionalEOSTokenIds.contains(token)
-                {
-                    break
-                }
-
-                detokenizer.append(token: token)
-                if let chunk = detokenizer.next() {
-                    tokenCount += 1
-
-                    // Process chunk through the tool call processor
-                    if let textToYield = toolCallProcessor.processChunk(chunk) {
-                        continuation.yield(.chunk(textToYield))
-                    }
-
-                    // Check if we have a complete tool call
-                    if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                        continuation.yield(.toolCall(toolCall))
-                    }
-                }
+            if promptTime == 0 {
+                let now = Date.timeIntervalSinceReferenceDate
+                promptTime = now - start
+                start = now
             }
 
-            let now = Date.timeIntervalSinceReferenceDate
-            let generateTime = now - start
+            if token == context.tokenizer.unknownTokenId
+                || token == context.tokenizer.eosTokenId
+                || additionalEOSTokenIds.contains(token)
+            {
+                break
+            }
 
-            let info = GenerateCompletionInfo(
-                promptTokenCount: input.text.tokens.size,
-                generationTokenCount: tokenCount,
-                promptTime: promptTime + iterator.promptPrefillTime,
-                generationTime: generateTime
-            )
-            continuation.yield(.info(info))
+            detokenizer.append(token: token)
+            if let chunk = detokenizer.next() {
+                tokenCount += 1
 
-            // Synchronize with the stream to ensure tasks are completed
-            Stream().synchronize()
+                // Process chunk through the tool call processor
+                if let textToYield = toolCallProcessor.processChunk(chunk) {
+                    continuation.yield(.chunk(textToYield))
+                }
 
-            // Finalize the stream
-            continuation.finish()
+                // Check if we have a complete tool call
+                if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                    continuation.yield(.toolCall(toolCall))
+                }
+            }
         }
-        // When the consumer cancels (or ends) the stream,
-        // cancel our underlying task.
-        continuation.onTermination = { _ in
-            task.cancel()
-        }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        let generateTime = now - start
+
+        let info = GenerateCompletionInfo(
+            promptTokenCount: input.text.tokens.size,
+            generationTokenCount: tokenCount,
+            promptTime: promptTime + iterator.promptPrefillTime,
+            generationTime: generateTime
+        )
+        continuation.yield(.info(info))
+
+        // Synchronize with the stream to ensure tasks are completed
+        Stream().synchronize()
+
+        // Finalize the stream
+        continuation.finish()
     }
+
+    // When the consumer cancels (or ends) the stream, cancel our underlying task.
+    continuation.onTermination = { _ in
+        task.cancel()
+    }
+
+    return stream
 }
 
 /// Represents metadata and statistics related to token generation.
@@ -927,9 +939,10 @@ public struct GenerateCompletionInfo: Sendable {
 ///
 /// This enum distinguishes between the following:
 /// - `.chunk`: A decoded string from one or more tokens generated by the language model.
+/// - `.toolCall`: A tool call parsed from the generated output.
 /// - `.info`: Metadata and performance statistics about the generation process.
 public enum Generation: Sendable {
-    /// A generated token represented as a String
+    /// A generated text chunk as a String.
     case chunk(String)
 
     /// Completion information summarizing token counts and performance metrics.

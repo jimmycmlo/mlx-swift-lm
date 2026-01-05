@@ -146,7 +146,7 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXArray? = nil, cache: KVCache?
+            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
         ) -> MLXArray {
             let startTime = CFAbsoluteTimeGetCurrent()
             defer {
@@ -175,20 +175,13 @@ private enum Language {
             Qwen2VLProfilingStats.rotaryEmbeddingTime += rotaryElapsed
             Qwen2VLProfilingStats.rotaryEmbeddingCount += 2  // Two calls
 
-            let maskConverted: MLXFast.ScaledDotProductAttentionMaskMode =
-                if let mask {
-                    .array(mask[.ellipsis, 0 ..< keys.dim(-2)])
-                } else {
-                    .none
-                }
-
             let output = attentionWithCacheUpdate(
                 queries: queries,
                 keys: keys,
                 values: values,
                 cache: cache,
                 scale: scale,
-                mask: maskConverted
+                mask: mask
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
@@ -232,7 +225,7 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXArray? = nil, cache: KVCache?
+            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
         ) -> MLXArray {
             var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
             let h = x + r
@@ -281,7 +274,7 @@ private enum Language {
                 fatalError("one of inputs or inputEmbedding must be non-nil")
             }
 
-            let mask: MLXArray? = createAttentionMask(h: h, cache: cache)
+            let mask = createAttentionMask(h: h, cache: cache?.first)
 
             for (i, layer) in layers.enumerated() {
                 h = layer(h, mask: mask, cache: cache?[i])
@@ -562,8 +555,6 @@ private enum Vision {
             var hiddenStates = patchEmbed(hiddenStates)
             let rotaryPositionEmbedding = rotaryPositionEmbedding(frames)
 
-            let batchSize = frames.count
-
             for block in blocks {
                 hiddenStates = block(
                     hiddenStates, frames: frames,
@@ -651,7 +642,7 @@ public class Qwen2VLProcessor: UserInputProcessor {
         print("resizedWidth: \(resizedSize.width), resizedHeight: \(resizedSize.height)")
         print("patcheSize: \(config.patchSize), mergeSize: \(config.mergeSize), minPixels: \(config.minPixels), maxPixels: \(config.maxPixels)")
 
-        let processedImages = try images.map { image in
+        let processedImages = images.map { image in
             preprocess(image: image, resizedSize: resizedSize).asMLXArray()
         }
 
@@ -1995,7 +1986,7 @@ public extension Qwen2VL {
 public struct Qwen2VLMessageGenerator: MessageGenerator {
     public init() {}
 
-    public func generate(message: Chat.Message) -> Message {
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
         [
             "role": message.role.rawValue,
             "content": [
