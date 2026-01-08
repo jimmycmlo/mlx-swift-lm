@@ -474,9 +474,23 @@ public final class LLMModelFactory: ModelFactory {
         hub: HubApi, configuration: ModelConfiguration,
         progressHandler: @Sendable @escaping (Progress) -> Void
     ) async throws -> ModelContext {
+        // Track download completion via progress handler
+        var downloadCompleted = false
+        var modelDirectoryURL: URL?
+        let wrappedProgressHandler: @Sendable (Progress) -> Void = { progress in
+            progressHandler(progress)
+            // Detect when download completes (progress reaches 1.0)
+            if progress.fractionCompleted >= 1.0 && !downloadCompleted {
+                downloadCompleted = true
+            }
+        }
+        
         // download weights and config
         let modelDirectory = try await downloadModel(
-            hub: hub, configuration: configuration, progressHandler: progressHandler)
+            hub: hub, configuration: configuration, progressHandler: wrappedProgressHandler) { url in
+            modelDirectoryURL = url
+            // Download completed - this is called by downloadModel when download finishes
+        }
 
         // Load the generic config to understand which model and how to load the weights
         let configurationURL = modelDirectory.appending(component: "config.json")
