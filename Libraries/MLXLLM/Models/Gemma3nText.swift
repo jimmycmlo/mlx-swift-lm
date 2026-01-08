@@ -15,18 +15,59 @@ import MLXNN
 
 // MARK: - Configuration
 
+/// A type that can be decoded as either a single Int or an array of Ints.
+/// This is needed because some models (like Gemma 3n) specify intermediate_size
+/// as a per-layer array, while others use a single value.
+public struct IntOrArray: Codable {
+    public let values: [Int]
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let array = try? container.decode([Int].self) {
+            self.values = array
+        } else if let single = try? container.decode(Int.self) {
+            self.values = [single]
+        } else {
+            throw DecodingError.typeMismatch(
+                IntOrArray.self,
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Expected Int or [Int]"
+                )
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        if values.count == 1 {
+            try container.encode(values[0])
+        } else {
+            try container.encode(values)
+        }
+    }
+
+    /// Get the intermediate size for a specific layer
+    public subscript(layerIdx: Int) -> Int {
+        if values.count == 1 {
+            return values[0]
+        }
+        return values[layerIdx]
+    }
+}
+
 public struct Gemma3nTextConfiguration: Codable {
     let modelType: String
     let hiddenSize: Int
     let numHiddenLayers: Int
-    let intermediateSize: Int
+    let intermediateSize: IntOrArray
     let numAttentionHeads: Int
     let headDim: Int
     let rmsNormEps: Float
     let vocabSize: Int
     let numKeyValueHeads: Int
     let numKvSharedLayers: Int
-    let queryPreAttnScalar: Float
+    let queryPreAttnScalar: Float?  // Optional - not present in all HF configs
     let vocabSizePerLayerInput: Int
     let slidingWindow: Int
     let maxPositionEmbeddings: Int
@@ -92,14 +133,14 @@ public struct Gemma3nTextConfiguration: Codable {
         modelType = try container.decode(String.self, forKey: .modelType)
         hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
         numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
-        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        intermediateSize = try container.decode(IntOrArray.self, forKey: .intermediateSize)
         numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
         headDim = try container.decode(Int.self, forKey: .headDim)
         rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
         vocabSize = try container.decode(Int.self, forKey: .vocabSize)
         numKeyValueHeads = try container.decode(Int.self, forKey: .numKeyValueHeads)
         numKvSharedLayers = try container.decode(Int.self, forKey: .numKvSharedLayers)
-        queryPreAttnScalar = try container.decode(Float.self, forKey: .queryPreAttnScalar)
+        queryPreAttnScalar = try container.decodeIfPresent(Float.self, forKey: .queryPreAttnScalar)
         vocabSizePerLayerInput = try container.decode(Int.self, forKey: .vocabSizePerLayerInput)
         slidingWindow = try container.decode(Int.self, forKey: .slidingWindow)
         maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
@@ -309,7 +350,7 @@ class Gemma3nMLP: Module {
     init(_ config: Gemma3nTextConfiguration, layerIdx: Int) {
         self.config = config
         self.hiddenSize = config.hiddenSize
-        self.intermediateSize = config.intermediateSize
+        self.intermediateSize = config.intermediateSize[layerIdx]
 
         if let activationSparsityPattern = config.activationSparsityPattern {
             self.activationSparsity = activationSparsityPattern[layerIdx]
@@ -963,9 +1004,13 @@ public class Gemma3nTextModel: Module, LLMModel {
 
         for (key, value) in weights {
             if key.hasPrefix("model.language_model.") {
+                // Remove "model." prefix for VLM-style weights
                 let newKey = key.replacingOccurrences(
                     of: "model.language_model.", with: "language_model.")
                 processedWeights[newKey] = value
+            } else {
+                // Keep other weights as-is
+                processedWeights[key] = value
             }
         }
 

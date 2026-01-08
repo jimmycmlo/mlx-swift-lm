@@ -6,13 +6,12 @@ import MLX
 import MLXLMCommon
 import Tokenizers
 
-/// Creates a function that loads a configuration file and instantiates a model with the proper configuration
+/// Creates a function that decodes configuration data and instantiates a model with the proper configuration
 private func create<C: Codable, M>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
-) -> (URL) throws -> M {
-    { url in
-        let configuration = try JSONDecoder().decode(
-            C.self, from: Data(contentsOf: url))
+) -> (Data) throws -> M {
+    { data in
+        let configuration = try JSONDecoder().decode(C.self, from: data)
         return modelInit(configuration)
     }
 }
@@ -47,6 +46,7 @@ public enum LLMTypeRegistry {
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
         "mimo": create(MiMoConfiguration.self, MiMoModel.init),
         "glm4": create(GLM4Configuration.self, GLM4Model.init),
+        "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
         "acereason": create(Qwen2Configuration.self, Qwen2Model.init),
         "falcon_h1": create(FalconH1Configuration.self, FalconH1Model.init),
         "bitnet": create(BitnetConfiguration.self, BitnetModel.init),
@@ -492,13 +492,18 @@ public final class LLMModelFactory: ModelFactory {
             // Download completed - this is called by downloadModel when download finishes
         }
 
-        // Load the generic config to understand which model and how to load the weights
+        // Load config.json once and decode for both base config and model-specific config
         let configurationURL = modelDirectory.appending(component: "config.json")
-
+        let configData: Data
+        do {
+            configData = try Data(contentsOf: configurationURL)
+        } catch {
+            throw ModelFactoryError.configurationFileError(
+                configurationURL.lastPathComponent, configuration.name, error)
+        }
         let baseConfig: BaseConfiguration
         do {
-            baseConfig = try JSONDecoder().decode(
-                BaseConfiguration.self, from: Data(contentsOf: configurationURL))
+            baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -507,18 +512,20 @@ public final class LLMModelFactory: ModelFactory {
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
-                configuration: configurationURL, modelType: baseConfig.modelType)
+                configuration: configData, modelType: baseConfig.modelType)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // apply the weights to the bare model
+        // Load tokenizer and weights in parallel using async let.
+        async let tokenizerTask = loadTokenizer(configuration: configuration, hub: hub)
+
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization)
 
-        let tokenizer = try await loadTokenizer(configuration: configuration, hub: hub)
+        let tokenizer = try await tokenizerTask
 
         let messageGenerator =
             if let model = model as? LLMModel {
