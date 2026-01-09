@@ -15,6 +15,43 @@ public extension Notification.Name {
     static let modelDownloadCompleted = Notification.Name("modelDownloadCompleted")
 }
 
+/// Check if a model is already downloaded locally.
+///
+/// - Parameters:
+///   - modelDirectory: The directory where the model should be stored
+/// - Returns: `true` if both `config.json` and at least one `*.safetensors` file exist
+private func isModelDownloaded(modelDirectory: URL) -> Bool {
+    let fileManager = FileManager.default
+    
+    // Check if directory exists
+    guard fileManager.fileExists(atPath: modelDirectory.path) else {
+        return false
+    }
+    
+    // Check if config.json exists
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard fileManager.fileExists(atPath: configURL.path) else {
+        return false
+    }
+    
+    // Check if at least one safetensors file exists
+    guard let enumerator = fileManager.enumerator(
+        at: modelDirectory,
+        includingPropertiesForKeys: [.isRegularFileKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return false
+    }
+    
+    for case let url as URL in enumerator {
+        if url.pathExtension == "safetensors" {
+            return true
+        }
+    }
+    
+    return false
+}
+
 /// Download the model using the `HubApi`.
 ///
 /// This will download `*.safetensors` and `*.json` if the ``ModelConfiguration``
@@ -33,10 +70,27 @@ public func downloadModel(
     progressHandler: @Sendable @escaping (Progress) -> Void = { _ in },
     completionHandler: (@Sendable (URL) -> Void)? = nil
 ) async throws -> URL {
+    let startTime = CFAbsoluteTimeGetCurrent()
+    defer {
+        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+        print("downloadModel took \(String(format: "%.2f", elapsed * 1000))ms")
+    }
+    
     do {
         let result: URL
         switch configuration.id {
         case .id(let id, let revision):
+            // Check if model is already downloaded
+            let modelDirectory = configuration.modelDirectory(hub: hub)
+            if isModelDownloaded(modelDirectory: modelDirectory) {
+                // Model already exists, return immediately
+                print("Model '\(id)' is already downloaded at: \(modelDirectory.path)")
+                if let completionHandler {
+                    completionHandler(modelDirectory)
+                }
+                return modelDirectory
+            }
+            
             // download the model weights
             let repo = Hub.Repo(id: id)
             let modelFiles = ["*.safetensors", "*.json"]
