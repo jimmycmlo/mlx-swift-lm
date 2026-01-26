@@ -178,11 +178,11 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         var processedVideo: LMInput.ProcessedVideo?
         if !input.videos.isEmpty {
             var accumulatedFrames: [[MLXArray]] = []
-            var resizedSize: CGSize = .zero
 
             for video in input.videos {
+                var resizedSize: CGSize = .zero
                 let sequence = try await MediaProcessing.asProcessedSequence(
-                    video.asAVAsset(), maxFrames: config.maxFrames, targetFPS: { _ in config.fps }
+                    video, targetFPS: { _ in Double(config.fps) }, maxFrames: config.maxFrames
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     if resizedSize == .zero {

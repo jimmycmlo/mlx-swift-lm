@@ -841,10 +841,12 @@ public class Qwen25VLProcessor: UserInputProcessor {
         var processedVideo: LMInput.ProcessedVideo?
         if !input.videos.isEmpty {
             var videosAsImageSequences = [[MLXArray]]()
-            var resizedSize: CGSize = .zero
             for video in input.videos {
+
+                var resizedSize: CGSize = .zero
+
                 let imageSequence = try await MediaProcessing.asProcessedSequence(
-                    video.asAVAsset(), maxFrames: config.maxFrames, targetFPS: { _ in config.fps }
+                    video, targetFPS: { _ in Double(config.fps) }, maxFrames: config.maxFrames
                 ) { frame in
                     // first apply the user requested resizing, etc. if any
                     let resizedImage = MediaProcessing.apply(
@@ -860,6 +862,7 @@ public class Qwen25VLProcessor: UserInputProcessor {
                     let processedImage = preprocess(image: resizedImage, resizedSize: resizedSize)
                     return VideoFrame(frame: processedImage, timeStamp: frame.timeStamp)
                 }
+
                 videosAsImageSequences.append(imageSequence.frames)
             }
             let videoPixelsAndFrames = try videosAsImageSequences.map {
