@@ -92,7 +92,7 @@ private enum Qwen3VLError: Error {
 
 // MARK: - Processor
 
-public final class Qwen3VLProcessor: UserInputProcessor {
+public struct Qwen3VLProcessor: UserInputProcessor {
 
     public var config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer

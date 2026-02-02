@@ -1,11 +1,16 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 5.12
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 
 let package = Package(
     name: "mlx-swift-lm",
-    platforms: [.macOS(.v14), .iOS(.v16)],
+    platforms: [
+        .macOS(.v14),
+        .iOS(.v17),
+        .tvOS(.v17),
+        .visionOS(.v1),
+    ],
     products: [
         .library(
             name: "MLXLLM",
@@ -21,7 +26,7 @@ let package = Package(
             targets: ["MLXEmbedders"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.29.1")),
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.2")),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.1.6")
@@ -36,7 +41,6 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "Libraries/MLXLLM",
@@ -55,7 +59,6 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "Libraries/MLXVLM",
@@ -70,10 +73,9 @@ let package = Package(
             name: "MLXLMCommon",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
-                .product(name: "MLXLinalg", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "Libraries/MLXLMCommon",
@@ -84,19 +86,51 @@ let package = Package(
                 .enableExperimentalFeature("StrictConcurrency")
             ]
         ),
+        .target(
+            name: "MLXEmbedders",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+                .target(name: "MLXLMCommon"),
+            ],
+            path: "Libraries/Embedders",
+            exclude: [
+                "README.md"
+            ]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
             ],
             path: "Tests/MLXLMTests",
+            exclude: [
+                "README.md"
+            ],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+        .testTarget(
+            name: "MLXLMIntegrationTests",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+            ],
+            path: "Tests/MLXLMIntegrationTests",
             exclude: [
                 "README.md"
             ],
@@ -114,21 +148,6 @@ let package = Package(
             path: "Tests/Benchmarks",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
-            ]
-        ),
-        .target(
-            name: "MLXEmbedders",
-            dependencies: [
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXFast", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "MLXLinalg", package: "mlx-swift"),
-                .target(name: "MLXLMCommon"),
-            ],
-            path: "Libraries/Embedders",
-            exclude: [
-                "README.md"
             ]
         ),
     ]
