@@ -469,49 +469,28 @@ public enum MediaProcessing {
 
         let duration = timeRangeOfVideoFrames.duration
 
-        let fps = targetFPS(duration)
-        // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
-        let estimatedFrames = Int(round(fps * duration.seconds))
-        let desiredFrames = min(estimatedFrames, videoFrames.count)
-        let finalFrameCount = max(desiredFrames, 1)
-
-        let sampledTimeValues = MLXArray.linspace(
-            0, duration.value, count: Int(finalFrameCount)
-        ).asArray(Int64.self)
-
-        // Construct a CMTime using the sampled CMTimeValue's and the asset's timescale
-        let timescale = duration.timescale
-
-        // Collect the frames
+        // Skip resampling - use frames directly as provided
+        // This allows representative frames to be used without resampling overhead
+        // and ensures frames are processed exactly as provided (no duplicates, no frame selection)
         var ciImages: [CIImage] = []
         var timestamps: [CMTime] = []
 
-        // See https://github.com/ml-explore/mlx-swift-lm/pull/64#discussion_r2713532157
-        // for rationalle for the follwing timing code
+        // Log the frames being processed
+        let frameTimestamps = videoFrames.map { String(format: "%.2f", $0.timeStamp.seconds) }.joined(separator: ", ")
+        print("🎬 [MediaProcessing] Processing \(videoFrames.count) frames directly (no resampling)")
+        print("🎬 [MediaProcessing] Frame timestamps: \(frameTimestamps)")
+        print("🎬 [MediaProcessing] Duration: \(String(format: "%.2f", duration.seconds))s")
 
-        var frameIndex = videoFrames.startIndex
-        for value in sampledTimeValues {
-            let targetTime = CMTime(value: value, timescale: timescale)
-
-            // find the last frame <= the targetTime
-            var targetIndex: Int?
-            while frameIndex < videoFrames.endIndex {
-                if videoFrames[frameIndex].timeStamp > targetTime {
-                    break
-                } else {
-                    targetIndex = frameIndex
-                    frameIndex += 1
-                }
-            }
-
-            if let targetIndex {
-                let videoFrame = videoFrames[targetIndex]
-                let frame = try frameProcessing(
-                    .init(frame: videoFrame.frame, timeStamp: videoFrame.timeStamp))
-                ciImages.append(frame.frame)
-                timestamps.append(frame.timeStamp)
-            }
+        // Process frames directly in order without resampling
+        for (index, videoFrame) in videoFrames.enumerated() {
+            let frame = try frameProcessing(
+                .init(frame: videoFrame.frame, timeStamp: videoFrame.timeStamp))
+            ciImages.append(frame.frame)
+            timestamps.append(frame.timeStamp)
+            print("🎬 [MediaProcessing] Processed frame \(index + 1)/\(videoFrames.count) at timestamp \(String(format: "%.2f", videoFrame.timeStamp.seconds))s")
         }
+        
+        print("🎬 [MediaProcessing] Successfully processed \(ciImages.count) frames")
 
         let framesAsArrays = ciImages.map { $0.asMLXArray() }
         return ProcessedFrames(
