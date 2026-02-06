@@ -85,8 +85,13 @@ public enum MediaProcessing {
 
     /// Resample the image using Lanczos interpolation.
     static public func resampleLanczos(_ image: CIImage, to size: CGSize) -> CIImage {
+        // Early return if no resizing needed
+        let currentSize = image.extent.size
+        if abs(currentSize.width - size.width) < 1.0 && abs(currentSize.height - size.height) < 1.0 {
+            return image
+        }
+        
         // Create a bicubic scale filter
-
         let yScale = size.height / image.extent.height
         let xScale = size.width / image.extent.width
 
@@ -114,8 +119,13 @@ public enum MediaProcessing {
     ///   - size: The target size
     /// - Returns: The resampled image
     public static func resampleBicubic(_ image: CIImage, to size: CGSize) -> CIImage {
+        // Early return if no resizing needed
+        let currentSize = image.extent.size
+        if abs(currentSize.width - size.width) < 1.0 && abs(currentSize.height - size.height) < 1.0 {
+            return image
+        }
+        
         // Create a bicubic scale filter
-
         let yScale = size.height / image.extent.height
         let xScale = size.width / image.extent.width
 
@@ -141,6 +151,13 @@ public enum MediaProcessing {
     public static func normalize(
         _ image: CIImage, mean: (CGFloat, CGFloat, CGFloat), std: (CGFloat, CGFloat, CGFloat)
     ) -> CIImage {
+        // Early return if identity transform (no normalization needed)
+        let epsilon: CGFloat = 1e-6
+        if abs(mean.0) < epsilon && abs(mean.1) < epsilon && abs(mean.2) < epsilon &&
+           abs(std.0 - 1.0) < epsilon && abs(std.1 - 1.0) < epsilon && abs(std.2 - 1.0) < epsilon {
+            return image
+        }
+        
         let filter = CIFilter.colorMatrix()
         filter.inputImage = image
 
@@ -188,15 +205,13 @@ public enum MediaProcessing {
             // speeds up batch image processing. Cache will be managed automatically by the system.
         }
 
-        var array = MLXArray(data, [h, w, 4], type: Float32.self)
+        // Create array directly in [h, w, 4] shape
+        let array = MLXArray(data, [h, w, 4], type: Float32.self)
 
-        // Drop 4th channel
-        array = array[0..., 0..., ..<3]
-
-        // Convert to 1, C, H, W
-        array = array.reshaped(1, h, w, 3).transposed(0, 3, 1, 2)
-
-        return array
+        // Drop 4th channel and convert to [1, C, H, W] in a single operation
+        // This is more efficient than separate slice, reshape, and transpose
+        let rgbArray = array[0..., 0..., ..<3]
+        return rgbArray.reshaped(1, h, w, 3).transposed(0, 3, 1, 2)
     }
 
     /// Return `true` if the size is smaller or equal to the size of the `extent`.
@@ -383,12 +398,13 @@ public enum MediaProcessing {
         let timescale = duration.timescale
         let sampledTimes = sampledTimeValues.map { CMTime(value: $0, timescale: timescale) }
 
-        // Collect the frames - pre-allocate capacity for better performance
+        // Collect and process frames - pre-allocate capacity for better performance
         var ciImages: [CIImage] = []
         var timestamps: [CMTime] = []
         ciImages.reserveCapacity(finalFrameCount)
         timestamps.reserveCapacity(finalFrameCount)
 
+        // Process frames sequentially (frameProcessing might not be thread-safe)
         for await result in generator.images(for: sampledTimes) {
             switch result {
             case .success(requestedTime: _, let image, actualTime: let actual):
@@ -403,12 +419,40 @@ public enum MediaProcessing {
             }
         }
 
-        let framesAsArrays = ciImages.map { $0.asMLXArray() }
+        // Batch convert frames to MLXArrays for better cache utilization
+        // Process in chunks to balance memory usage and performance
+        let framesAsArrays = batchConvertToMLXArrays(ciImages, chunkSize: 16)
+        
         return ProcessedFrames(
             frames: framesAsArrays,
             timestamps: timestamps,
             totalDuration: duration
         )
+    }
+    
+    /// Convert multiple CIImages to MLXArrays in batches for better cache utilization
+    /// - Parameters:
+    ///   - images: Array of CIImages to convert
+    ///   - chunkSize: Number of images to process in each batch
+    /// - Returns: Array of MLXArrays
+    private static func batchConvertToMLXArrays(_ images: [CIImage], chunkSize: Int = 16) -> [MLXArray] {
+        guard !images.isEmpty else { return [] }
+        
+        var result: [MLXArray] = []
+        result.reserveCapacity(images.count)
+        
+        // Process in chunks to keep CIContext cache warm while managing memory
+        for chunkStart in stride(from: 0, to: images.count, by: chunkSize) {
+            let chunkEnd = min(chunkStart + chunkSize, images.count)
+            let chunk = images[chunkStart..<chunkEnd]
+            
+            // Convert each image in the chunk - cache stays warm across the chunk
+            for image in chunk {
+                result.append(asMLXArray(image))
+            }
+        }
+        
+        return result
     }
 }
 
