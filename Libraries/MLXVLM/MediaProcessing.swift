@@ -16,7 +16,15 @@ public struct ProcessedFrames {
     let totalDuration: CMTime
 }
 
-private let context = CIContext()
+// Optimized CIContext with caching enabled
+private let context = CIContext(options: [
+    .cacheIntermediates: true,
+    .priorityRequestLow: false,
+    .useSoftwareRenderer: false
+])
+
+// Cache frequently used colorspace to avoid recreating it
+private let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
 /// Collection of methods for processing media (images, video, etc.).
 ///
@@ -176,7 +184,8 @@ public enum MediaProcessing {
             context.render(
                 image, toBitmap: ptr.baseAddress!, rowBytes: bytesPerRow, bounds: image.extent,
                 format: format, colorSpace: colorSpace)
-            context.clearCaches()
+            // NOTE: clearCaches() removed for performance - CIContext caching significantly
+            // speeds up batch image processing. Cache will be managed automatically by the system.
         }
 
         var array = MLXArray(data, [h, w, 4], type: Float32.self)
@@ -303,21 +312,27 @@ public enum MediaProcessing {
         let samplesPerSecond = Double(samplesPerSecond)
         let totalFramesToSample = durationInSeconds * samplesPerSecond
         let durationTimeValue = duration.value
-        let sampledTimeValues = MLXArray.linspace(
-            0, durationTimeValue, count: Int(totalFramesToSample)
-        ).asArray(Int64.self)
+        
+        // Optimized: Use Swift stride instead of MLXArray.linspace to avoid GPU roundtrip
+        let frameCount = Int(totalFramesToSample)
+        let sampledTimeValues = (0..<frameCount).map { i in
+            Int64(Double(i) * Double(durationTimeValue) / Double(frameCount))
+        }
 
         // Construct a CMTime using the sampled CMTimeValue's and the asset's timescale
         let timescale = duration.timescale
         let sampledTimes = sampledTimeValues.map { CMTime(value: $0, timescale: timescale) }
 
-        // Collect the frames
+        // Collect the frames - pre-allocate capacity for better performance
         var ciImages: [CIImage] = []
+        ciImages.reserveCapacity(frameCount)
+        
         for await result in generator.images(for: sampledTimes) {
             switch result {
             case .success(requestedTime: _, let image, actualTime: _):
+                // Use cached sRGBColorSpace instead of creating new one
                 let ciImage = CIImage(
-                    cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+                    cgImage: image, options: [.colorSpace: sRGBColorSpace])
                 ciImages.append(ciImage)
             case .failure(requestedTime: _, _):
                 break
@@ -358,23 +373,28 @@ public enum MediaProcessing {
         let desiredFrames = min(estimatedFrames, maxFrames)
         let finalFrameCount = max(desiredFrames, 1)
         print("finalFrameCount: \(finalFrameCount)")
-        let sampledTimeValues = MLXArray.linspace(
-            0, duration.value, count: Int(finalFrameCount)
-        ).asArray(Int64.self)
+        
+        // Optimized: Use Swift stride instead of MLXArray.linspace to avoid GPU roundtrip
+        let sampledTimeValues = (0..<finalFrameCount).map { i in
+            Int64(Double(i) * Double(duration.value) / Double(finalFrameCount))
+        }
 
         // Construct a CMTime using the sampled CMTimeValue's and the asset's timescale
         let timescale = duration.timescale
         let sampledTimes = sampledTimeValues.map { CMTime(value: $0, timescale: timescale) }
 
-        // Collect the frames
+        // Collect the frames - pre-allocate capacity for better performance
         var ciImages: [CIImage] = []
         var timestamps: [CMTime] = []
+        ciImages.reserveCapacity(finalFrameCount)
+        timestamps.reserveCapacity(finalFrameCount)
 
         for await result in generator.images(for: sampledTimes) {
             switch result {
             case .success(requestedTime: _, let image, actualTime: let actual):
+                // Use cached sRGBColorSpace instead of creating new one
                 let ciImage = CIImage(
-                    cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+                    cgImage: image, options: [.colorSpace: sRGBColorSpace])
                 let frame = try frameProcessing(.init(frame: ciImage, timeStamp: actual))
                 ciImages.append(frame.frame)
                 timestamps.append(frame.timeStamp)
