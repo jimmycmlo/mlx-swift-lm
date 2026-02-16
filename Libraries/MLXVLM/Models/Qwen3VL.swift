@@ -407,7 +407,10 @@ public final class Qwen3VLProcessor: UserInputProcessor {
         
         do {
             let cgImage = try await generator.image(at: cmTime).image
-            return CIImage(cgImage: cgImage, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+            // Normalize CGImage first (HDR/10-bit → 8-bit sRGB) to avoid "invalid image bits/pixel"
+            let normalizedCG = MediaProcessing.normalizeCGImageForVLM(cgImage) ?? cgImage
+            let rawCIImage = CIImage(cgImage: normalizedCG, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+            return MediaProcessing.normalizeForVLM(rawCIImage)
         } catch {
             throw NSError(
                 domain: "VideoProcessing", 

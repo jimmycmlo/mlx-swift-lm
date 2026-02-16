@@ -190,6 +190,67 @@ public enum MediaProcessing {
         return array
     }
 
+    /// Normalize a CGImage to standard 8-bit RGBA sRGB before creating CIImage.
+    /// AVAssetImageGenerator can return CGImages with HDR, 10-bit, or exotic formats that
+    /// cause downstream failures. Drawing into a CGBitmapContext forces a known format.
+    public static func normalizeCGImageForVLM(_ cgImage: CGImage) -> CGImage? {
+        let w = cgImage.width
+        let h = cgImage.height
+        guard w > 0, h > 0 else { return nil }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        guard let ctx = CGContext(
+            data: nil,
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: w * 4,
+            space: cs,
+            bitmapInfo: bitmapInfo.rawValue
+        ) else { return nil }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    /// Normalize a CIImage to a format safe for VLM processing.
+    /// Some video frames (HDR, 10-bit, odd color spaces) produce CIImages that cause
+    /// "invalid image bits/pixel" or "noObservations" errors downstream. Re-rendering
+    /// to a known pixel buffer produces a standard 8-bit sRGB representation.
+    /// Uses the same render path as asMLXArray for consistency and reliability.
+    public static func normalizeForVLM(_ image: CIImage) -> CIImage {
+        let extent = image.extent.standardized
+        let w = Int(extent.width.rounded())
+        let h = Int(extent.height.rounded())
+        guard extent.isInfinite == false, extent.isEmpty == false, w > 1, h > 1 else {
+            return image
+        }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let format = CIFormat.RGBA8
+        let bytesPerPixel = 4
+        var bytesPerRow = w * bytesPerPixel
+        bytesPerRow = (bytesPerRow + 15) & ~15  // 16-byte alignment for stability
+        var data = Data(count: bytesPerRow * h)
+        data.withUnsafeMutableBytes { ptr in
+            context.render(
+                image,
+                toBitmap: ptr.baseAddress!,
+                rowBytes: bytesPerRow,
+                bounds: extent,
+                format: format,
+                colorSpace: cs
+            )
+            context.clearCaches()
+        }
+
+        return CIImage(
+            bitmapData: data,
+            bytesPerRow: bytesPerRow,
+            size: CGSize(width: w, height: h),
+            format: format,
+            colorSpace: cs
+        )
+    }
+
     /// Return `true` if the size is smaller or equal to the size of the `extent`.
     public static func rectSmallerOrEqual(_ extent: CGRect, size: CGSize) -> Bool {
         return extent.width <= size.width && extent.height <= size.height
@@ -373,8 +434,10 @@ public enum MediaProcessing {
         for await result in generator.images(for: sampledTimes) {
             switch result {
             case .success(requestedTime: _, let image, actualTime: let actual):
-                let ciImage = CIImage(
-                    cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+                let normalizedCG = normalizeCGImageForVLM(image) ?? image
+                let rawCIImage = CIImage(
+                    cgImage: normalizedCG, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+                let ciImage = normalizeForVLM(rawCIImage)
                 let frame = try frameProcessing(.init(frame: ciImage, timeStamp: actual))
                 ciImages.append(frame.frame)
                 timestamps.append(frame.timeStamp)
