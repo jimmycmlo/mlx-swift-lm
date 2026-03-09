@@ -1020,6 +1020,17 @@ enum Qwen35Language {
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel {
+
+    /// Frame specification for selective video processing
+    public enum FrameSpecification {
+        /// Process specific frame numbers (0-based indexing)
+        case frameNumbers([Int])
+        /// Process frames at specific timestamps (in seconds)
+        case timestamps([TimeInterval])
+        /// Process all frames (default behavior)
+        case allFrames
+    }
+
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -1162,6 +1173,123 @@ public class Qwen35: Module, VLMModel {
         )
 
         return .logits(output)
+    }
+
+    /// Prepare input with frame specification for selective video processing
+    ///
+    /// This method allows you to control which frames from videos are processed
+    /// during the preprocessing stage, enabling more efficient video analysis.
+    ///
+    /// - Parameter input: The LMInput containing processed text, images, and/or videos
+    /// - Parameter cache: The KV cache for the model
+    /// - Parameter windowSize: Optional window size for processing
+    /// - Parameter frameSpecification: Which frames to process (frame numbers, timestamps, or all frames)
+    /// - Parameter fps: Frames per second for timestamp conversion (default: 2.0)
+    /// - Returns: The prepared result with selective frame processing
+    public func prepareWithFrameSpecification(
+        _ input: LMInput,
+        cache: [any KVCache],
+        windowSize _: Int?,
+        frameSpecification: FrameSpecification,
+        fps: Double = 2.0
+    ) throws -> PrepareResult {
+        let inputIds = input.text.tokens
+
+        var pixelValues: MLXArray?
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
+
+        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        var pixelParts: [MLXArray] = []
+
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            imageFrames = image.frames
+        }
+
+        if let video = input.video, let frames = video.frames {
+            let (filteredPixels, filteredFrames) = try applyFrameSpecificationToVideo(
+                videoPixels: video.pixels,
+                videoFrames: frames,
+                frameSpecification: frameSpecification,
+                fps: fps
+            )
+            pixelParts.append(filteredPixels.asType(visionDType))
+            videoFrames = filteredFrames
+        }
+
+        if !pixelParts.isEmpty {
+            pixelValues = concatenated(pixelParts)
+        }
+
+        var inputEmbeddings: MLXArray?
+
+        if let pixelValues,
+            let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+                .nilIfEmpty
+        {
+            let textEmbeds = languageModel.model.embedTokens(inputIds)
+            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            let visionFeatures = visionHidden.asType(textEmbeds.dtype)
+
+            let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                imageFeatures: visionFeatures,
+                inputEmbeds: textEmbeds,
+                inputIds: inputIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex
+            )
+            inputEmbeddings = mergedEmbeds
+        } else {
+            languageModel.resetPositionState()
+        }
+
+        let typedCache = castCache(cache)
+        let output = languageModel(
+            inputIds,
+            inputsEmbeds: inputEmbeddings,
+            cache: typedCache,
+            mask: input.text.mask,
+            positionIds: nil,
+            pixelValues: pixelValues,
+            imageGridTHW: imageFrames,
+            videoGridTHW: videoFrames
+        )
+
+        return .logits(output)
+    }
+
+    private func applyFrameSpecificationToVideo(
+        videoPixels: MLXArray,
+        videoFrames: [THW],
+        frameSpecification: FrameSpecification,
+        fps: Double
+    ) throws -> (MLXArray, [THW]) {
+        switch frameSpecification {
+        case .allFrames:
+            return (videoPixels, videoFrames)
+
+        case .frameNumbers(let frameNumbers):
+            let validIndices = frameNumbers.filter { $0 >= 0 && $0 < videoFrames.count }
+            if validIndices.isEmpty {
+                throw NSError(
+                    domain: "VideoProcessing", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "No valid frame numbers provided"]
+                )
+            }
+            let filteredPixels = videoPixels[MLXArray(validIndices), 0..., 0..., 0...]
+            let filteredFrames = validIndices.map { videoFrames[$0] }
+            return (filteredPixels, filteredFrames)
+
+        case .timestamps(let timestamps):
+            let frameNumbers = timestamps.map { Int($0 * fps) }
+            return try applyFrameSpecificationToVideo(
+                videoPixels: videoPixels,
+                videoFrames: videoFrames,
+                frameSpecification: .frameNumbers(frameNumbers),
+                fps: fps
+            )
+        }
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

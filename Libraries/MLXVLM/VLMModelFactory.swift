@@ -230,6 +230,16 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Describe the image in English"
     )
 
+    static public let `qwen3_5_2B-4bit` = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-2B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let `qwen3_5_4B-4bit` = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-4B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
     static public func all() -> [ModelConfiguration] {
         [
             paligemma3bMix448_8bit,
@@ -238,6 +248,8 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3VL4BInstruct4Bit,
             qwen3VL4BInstruct8Bit,
             qwen3VL2BInstruct4Bit,
+            `qwen3_5_4B-4bit`,
+            `qwen3_5_2B-4bit`,
             smolvlminstruct4bit,
             gemma3_4B_qat_4bit,
             gemma3_12B_qat_4bit,
