@@ -118,3 +118,36 @@ The stream is stopped after we hit a maximum number of tokens:
     }
 }
 ```
+
+### Wired Memory (Optional)
+
+Use the policy-based API to coordinate a single global wired limit across tasks.
+`WiredMemoryManager` and `WiredMemoryTicket` are provided by MLX, while
+MLXLMCommon adds LLM-oriented policies (like `WiredFixedPolicy` or capped sum).
+Policy-only admission is enabled by default on unsupported backends so the same
+ticket logic applies on CPU (no OS limit changes are attempted).
+
+```swift
+let policy = WiredSumPolicy()
+let ticket = policy.ticket(size: estimatedBytes)
+
+let stream = try MLXLMCommon.generate(
+    input: input,
+    parameters: generateParameters,
+    context: context,
+    wiredMemoryTicket: ticket
+)
+```
+
+Policies are pure and compute a single limit for all active tickets. Built-in
+policies include `WiredSumPolicy`, `WiredMaxPolicy`, and `WiredFixedPolicy`.
+Use `WiredMemoryTicket.withWiredLimit` for cancellation-safe start/end pairing.
+
+Policies can also gate concurrency by implementing `canAdmit`. When admission is
+denied, `start()` suspends until capacity is available. For debugging, the
+`WiredMemoryManager.events()` stream emits changes in DEBUG builds and is a no-op
+in release builds.
+
+If you want to account for long-lived model weights without keeping the wired
+limit elevated while idle, create tickets with `kind: .reservation` so they
+participate in admission and limit calculation only when active tickets exist.

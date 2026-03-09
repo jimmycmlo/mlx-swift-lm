@@ -5,7 +5,7 @@
 //  Created by Anthony DePasquale on 14.03.2025.
 //
 
-// Based on https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/gemma3_text.py
+// Based on https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma3_text.py
 
 import Foundation
 import MLX
@@ -373,6 +373,18 @@ public class Gemma3TextModel: Module, LLMModel {
         let unflattened = ModuleParameters.unflattened(weights)
         if let lm = unflattened["language_model"] {
             processedWeights = Dictionary(uniqueKeysWithValues: lm.flattened())
+        }
+
+        let expectedVocab = config.vocabularySize
+        let keysToCheck = [
+            "model.embed_tokens.weight", "model.embed_tokens.scales", "model.embed_tokens.biases",
+            "lm_head.weight", "lm_head.scales", "lm_head.biases",
+        ]
+
+        for key in keysToCheck {
+            if let tensor = processedWeights[key], tensor.dim(0) > expectedVocab {
+                processedWeights[key] = tensor[0 ..< expectedVocab]
+            }
         }
 
         if processedWeights["lm_head.weight"] == nil {
