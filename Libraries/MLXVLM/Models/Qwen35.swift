@@ -358,24 +358,31 @@ enum Qwen35Language {
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
-            let freqsT = freqs[0, 0..., 0..., 0...]
-            let dims = freqsT.dim(-1)
-            var slices: [MLXArray] = []
-            slices.reserveCapacity(dims)
+            // Vectorized: build three 1D masks from mropeSection, then f0*m0 + f1*m1 + f2*m2
+            // Replaces per-dimension loop (for idx in 0..<dims) with a few batched ops
+            let f0 = freqs[0, 0..., 0..., 0...]
+            let f1 = freqs[1, 0..., 0..., 0...]
+            let f2 = freqs[2, 0..., 0..., 0...]
+            let dims = f0.dim(-1)
+            let batch = f0.dim(0)
+            let seqLen = f0.dim(1)
 
-            for idx in 0 ..< dims {
-                var slice = freqsT[0..., 0..., idx]
-                for (dim, offset) in [(1, 1), (2, 2)] {
-                    let length = min(mropeSection[dim] * 3, dims)
-                    if idx >= offset && idx < length && ((idx - offset) % 3 == 0) {
-                        slice = freqs[dim, 0..., 0..., idx]
-                        break
-                    }
-                }
-                slices.append(slice)
-            }
+            let indices = MLXArray(0 ..< dims).asType(.int32)
+            let hEnd = min(mropeSection[1] * 3, dims)
+            let wEnd = min(mropeSection[2] * 3, dims)
 
-            return stacked(slices, axis: -1)
+            let m1 = (indices .>= 1) .&& (indices .< hEnd) .&& ((indices - 1) % 3 .== 0)
+            let m2 = (indices .>= 2) .&& (indices .< wEnd) .&& ((indices - 2) % 3 .== 0)
+
+            let m1Float = m1.asType(.float32)
+            let m2Float = m2.asType(.float32)
+            let m0Float = 1 - m1Float - m2Float
+
+            let m0 = broadcast(m0Float.reshaped(1, 1, dims), to: [batch, seqLen, dims])
+            let m1Expanded = broadcast(m1Float.reshaped(1, 1, dims), to: [batch, seqLen, dims])
+            let m2Expanded = broadcast(m2Float.reshaped(1, 1, dims), to: [batch, seqLen, dims])
+
+            return f0 * m0 + f1 * m1Expanded + f2 * m2Expanded
         }
 
         func callAsFunction(x: MLXArray, positionIds: MLXArray) -> (MLXArray, MLXArray) {
