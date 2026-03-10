@@ -108,6 +108,43 @@ public struct GenerateParameters: Sendable {
         self.prefillStepSize = prefillStepSize
     }
 
+    /// Returns parameters with KV cache quantization enabled.
+    ///
+    /// Use for ~10–20% generation speed and lower memory; may slightly hurt quality.
+    /// Set `quantizedKVStart` to keep the first N tokens in full precision.
+    ///
+    /// - Parameters:
+    ///   - bits: 4 or 8 bits (default: 4)
+    ///   - quantizedKVStart: Token count threshold to begin quantizing (default: 0)
+    ///   - kvGroupSize: Quantization group size (default: 64)
+    ///   - maxTokens: Maximum tokens to generate
+    ///   - temperature: Sampling temperature
+    ///   - prefillStepSize: Step size for prompt processing
+    public static func withQuantizedKV(
+        bits: Int = 4,
+        quantizedKVStart: Int = 0,
+        kvGroupSize: Int = 64,
+        maxTokens: Int? = nil,
+        temperature: Float = 0.6,
+        topP: Float = 1.0,
+        repetitionPenalty: Float? = nil,
+        repetitionContextSize: Int = 20,
+        prefillStepSize: Int = 512
+    ) -> GenerateParameters {
+        GenerateParameters(
+            maxTokens: maxTokens,
+            maxKVSize: nil,
+            kvBits: bits,
+            kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart,
+            temperature: temperature,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            repetitionContextSize: repetitionContextSize,
+            prefillStepSize: prefillStepSize
+        )
+    }
+
     public func sampler() -> LogitSampler {
         if temperature == 0 {
             return ArgMaxSampler()
