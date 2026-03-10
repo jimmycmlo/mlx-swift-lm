@@ -3,6 +3,17 @@ import MLX
 import MLXLMCommon
 import Testing
 
+@Test func generateParametersWithQuantizedKV() {
+    let params = GenerateParameters.withQuantizedKV(bits: 4, quantizedKVStart: 0)
+    #expect(params.kvBits == 4)
+    #expect(params.quantizedKVStart == 0)
+    #expect(params.kvGroupSize == 64)
+
+    let paramsWithStart = GenerateParameters.withQuantizedKV(bits: 8, quantizedKVStart: 128)
+    #expect(paramsWithStart.kvBits == 8)
+    #expect(paramsWithStart.quantizedKVStart == 128)
+}
+
 @Test(
     .serialized,
     arguments: [
