@@ -11,7 +11,7 @@ private func create<C: Codable, M>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
 ) -> (Data) throws -> M {
     { data in
-        let configuration = try JSONDecoder().decode(C.self, from: data)
+        let configuration = try JSONDecoder.json5().decode(C.self, from: data)
         return modelInit(configuration)
     }
 }
@@ -36,6 +36,11 @@ public enum LLMTypeRegistry {
         "qwen2": create(Qwen2Configuration.self, Qwen2Model.init),
         "qwen3": create(Qwen3Configuration.self, Qwen3Model.init),
         "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
+        "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
+        "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
+        "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),
         "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
@@ -45,8 +50,11 @@ public enum LLMTypeRegistry {
         "granitemoehybrid": create(
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
         "mimo": create(MiMoConfiguration.self, MiMoModel.init),
+        "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
+        "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
         "glm4": create(GLM4Configuration.self, GLM4Model.init),
         "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
+        "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
         "acereason": create(Qwen2Configuration.self, Qwen2Model.init),
         "falcon_h1": create(FalconH1Configuration.self, FalconH1Model.init),
         "bitnet": create(BitnetConfiguration.self, BitnetModel.init),
@@ -63,9 +71,11 @@ public enum LLMTypeRegistry {
         "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
+        "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
+        "apertus": create(ApertusConfiguration.self, ApertusModel.init),
     ])
 }
 
@@ -266,7 +276,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let glm4_9b_4bit = ModelConfiguration(
         id: "mlx-community/GLM-4-9B-0414-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        toolCallFormat: .glm4
     )
 
     static public let acereason_7b_4bit = ModelConfiguration(
@@ -296,7 +307,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let lfm2_1_2b_4bit = ModelConfiguration(
         id: "mlx-community/LFM2-1.2B-4bit",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        toolCallFormat: .lfm2
     )
 
     static public let exaone_4_0_1_2b_4bit = ModelConfiguration(
@@ -331,7 +343,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let lfm2_8b_a1b_3bit_mlx = ModelConfiguration(
         id: "mlx-community/LFM2-8B-A1B-3bit-MLX",
-        defaultPrompt: ""
+        defaultPrompt: "",
+        toolCallFormat: .lfm2
     )
 
     static public let nanochat_d20_mlx = ModelConfiguration(
@@ -503,7 +516,7 @@ public final class LLMModelFactory: ModelFactory {
         }
         let baseConfig: BaseConfiguration
         do {
-            baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
+            baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -516,6 +529,26 @@ public final class LLMModelFactory: ModelFactory {
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
+        }
+
+        // Load EOS token IDs from config.json, with optional override from generation_config.json
+        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
+        if let generationData = try? Data(contentsOf: generationConfigURL),
+            let generationConfig = try? JSONDecoder.json5().decode(
+                GenerationConfigFile.self, from: generationData),
+            let genEosIds = generationConfig.eosTokenIds?.values
+        {
+            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
+        }
+
+        // Create mutable configuration with loaded EOS token IDs
+        var mutableConfiguration = configuration
+        mutableConfiguration.eosTokenIds = eosTokenIds
+
+        // Auto-detect tool call format from model type if not explicitly set
+        if mutableConfiguration.toolCallFormat == nil {
+            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
         // Load tokenizer and weights in parallel using async let.
@@ -535,11 +568,12 @@ public final class LLMModelFactory: ModelFactory {
             }
 
         let processor = LLMUserInputProcessor(
-            tokenizer: tokenizer, configuration: configuration,
+            tokenizer: tokenizer, configuration: mutableConfiguration,
             messageGenerator: messageGenerator)
 
         return .init(
-            configuration: configuration, model: model, processor: processor, tokenizer: tokenizer)
+            configuration: mutableConfiguration, model: model, processor: processor,
+            tokenizer: tokenizer)
     }
 
 }

@@ -2,7 +2,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -42,7 +41,7 @@ class Mistral3Attention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: Module
+    let rope: RoPELayer
 
     init(_ args: Mistral3TextConfiguration) {
         self.args = args
@@ -59,12 +58,8 @@ class Mistral3Attention: Module {
         self._wv.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
         self._wo.wrappedValue = Linear(nHeads * headDim, dim, bias: false)
 
-        // Initialize RoPE using rope_parameters - rope_theta is required like in Python
-        guard let ropeParams = args.ropeParameters,
-            let ropeTheta = ropeParams["rope_theta"]?.asFloat()
-        else {
-            fatalError("rope_parameters['rope_theta'] is required")
-        }
+        // Initialize RoPE: prefer rope_parameters dict, fall back to direct ropeTheta
+        let ropeTheta = args.ropeParameters?["rope_theta"]?.asFloat() ?? args.ropeTheta
         self.rope = initializeRope(
             dims: headDim,
             base: ropeTheta,
@@ -74,19 +69,6 @@ class Mistral3Attention: Module {
         )
 
         super.init()
-    }
-
-    private func applyRoPE(_ x: MLXArray, offset: Int) -> MLXArray {
-        if let ropeModule = rope as? RoPE {
-            return ropeModule(x, offset: offset)
-        } else if let llama3Rope = rope as? Llama3RoPE {
-            return llama3Rope(x, offset: offset)
-        } else if let yarnRope = rope as? YarnRoPE {
-            return yarnRope(x, offset: offset)
-        } else if let suScaledRope = rope as? SuScaledRoPE {
-            return suScaledRope(x, offset: offset)
-        }
-        return x
     }
 
     func callAsFunction(
@@ -106,8 +88,8 @@ class Mistral3Attention: Module {
 
         // Apply RoPE
         let offset = cache?.offset ?? 0
-        queries = applyRoPE(queries, offset: offset)
-        keys = applyRoPE(keys, offset: offset)
+        queries = rope(queries, offset: offset)
+        keys = rope(keys, offset: offset)
 
         // Apply attention scaling
         queries = queries * attnScale
@@ -260,22 +242,22 @@ public class Mistral3TextModelInner: Module {
             swaMask = .none
         }
 
-        // Compute attention scale - these parameters are required like in Python
-        guard let ropeParams = args.ropeParameters,
+        // Compute attention scale: use llama4 scaling if parameters are available,
+        // otherwise use a constant scale of 1.0
+        let attnScale: MLXArray
+        if let ropeParams = args.ropeParameters,
             let llama4ScalingBeta = ropeParams["llama_4_scaling_beta"]?.asFloat(),
             let originalMaxPosEmbed = ropeParams["original_max_position_embeddings"]?.asInt()
-        else {
-            fatalError(
-                "rope_parameters must contain 'llama_4_scaling_beta' and 'original_max_position_embeddings'"
-            )
+        {
+            attnScale = getLlama4AttentionScale(
+                start: offset,
+                stop: offset + inputs.dim(1),
+                beta: llama4ScalingBeta,
+                maxPositionEmbeddings: originalMaxPosEmbed
+            ).asType(h.dtype)
+        } else {
+            attnScale = MLXArray.ones([inputs.dim(1), 1]).asType(h.dtype)
         }
-
-        let attnScale = getLlama4AttentionScale(
-            start: offset,
-            stop: offset + inputs.dim(1),
-            beta: llama4ScalingBeta,
-            maxPositionEmbeddings: originalMaxPosEmbed
-        ).asType(h.dtype)
 
         // Process through transformer layers
         for (i, layer) in layers.enumerated() {
@@ -392,6 +374,7 @@ public struct Mistral3TextConfiguration: Codable, Sendable {
     var headDimensions: Int?
     var maxPositionEmbeddings: Int?
     var kvHeads: Int
+    var ropeTheta: Float = 10_000
     var ropeParameters: [String: StringOrNumber]?
     var tieWordEmbeddings: Bool = false
     var layerTypes: [String]
@@ -412,6 +395,7 @@ public struct Mistral3TextConfiguration: Codable, Sendable {
         case headDimensions = "head_dim"
         case maxPositionEmbeddings = "max_position_embeddings"
         case kvHeads = "num_key_value_heads"
+        case ropeTheta = "rope_theta"
         case ropeParameters = "rope_parameters"
         case tieWordEmbeddings = "tie_word_embeddings"
         case layerTypes = "layer_types"
@@ -446,6 +430,8 @@ public struct Mistral3TextConfiguration: Codable, Sendable {
         maxPositionEmbeddings = try container.decodeIfPresent(
             Int.self, forKey: .maxPositionEmbeddings)
         kvHeads = try container.decodeIfPresent(Int.self, forKey: .kvHeads) ?? attentionHeads
+        ropeTheta =
+            try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 10_000
         ropeParameters = try container.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeParameters)
 
@@ -475,6 +461,7 @@ public struct Mistral3TextConfiguration: Codable, Sendable {
         headDimensions: Int? = nil,
         maxPositionEmbeddings: Int? = nil,
         kvHeads: Int? = nil,
+        ropeTheta: Float = 10_000,
         ropeParameters: [String: StringOrNumber]? = nil,
         tieWordEmbeddings: Bool = true,
         layerTypes: [String]? = nil,
@@ -490,6 +477,7 @@ public struct Mistral3TextConfiguration: Codable, Sendable {
         self.headDimensions = headDimensions
         self.maxPositionEmbeddings = maxPositionEmbeddings
         self.kvHeads = kvHeads ?? attentionHeads
+        self.ropeTheta = ropeTheta
         self.ropeParameters = ropeParameters
         self.tieWordEmbeddings = tieWordEmbeddings
         self.layerTypes = layerTypes ?? Array(repeating: "full_attention", count: hiddenLayers)

@@ -5,9 +5,10 @@
 //  Created by John Mai on 2025/10/01.
 //
 
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/ssm.py
+
 import Foundation
 import MLX
-import MLXFast
 import MLXNN
 
 public func computeDt(_ dt: MLXArray, _ dtBias: MLXArray, _ timeStepLimit: (Float, Float))
@@ -66,7 +67,7 @@ private func makeSSMKernel() -> MLXFast.MLXFastKernel? {
     )
 }
 
-private final class SSMKernelManager: @unchecked Sendable {
+private final class SSMKernelManager: Sendable {
     static let shared = SSMKernelManager()
 
     let ssmKernel: MLXFast.MLXFastKernel?

@@ -1,5 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
+// port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/qwen3_vl
+
 import AVFoundation
 import CoreImage
 import CoreMedia
@@ -92,7 +94,7 @@ private enum Qwen3VLError: Error {
 
 // MARK: - Processor
 
-public final class Qwen3VLProcessor: UserInputProcessor {
+public struct Qwen3VLProcessor: UserInputProcessor {
 
     public var config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -149,7 +151,11 @@ public final class Qwen3VLProcessor: UserInputProcessor {
 
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = Qwen3VLMessageGenerator().generate(from: input)
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools)
+        var promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: input.tools,
+            additionalContext: input.additionalContext
+        )
 
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
@@ -178,11 +184,11 @@ public final class Qwen3VLProcessor: UserInputProcessor {
         var processedVideo: LMInput.ProcessedVideo?
         if !input.videos.isEmpty {
             var accumulatedFrames: [[MLXArray]] = []
-            var resizedSize: CGSize = .zero
 
             for video in input.videos {
+                var resizedSize: CGSize = .zero
                 let sequence = try await MediaProcessing.asProcessedSequence(
-                    video.asAVAsset(), maxFrames: config.maxFrames, targetFPS: { _ in config.fps }
+                    video, targetFPS: { _ in Double(config.fps) }, maxFrames: config.maxFrames
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     if resizedSize == .zero {
@@ -1770,6 +1776,7 @@ extension Qwen3VLLanguage {
             var llmPosIdsList: [MLXArray] = []
 
             var st = 0
+            var stIdx = 0  // Track on host to avoid device→host syncs
             var remainImages = imageNums
             var remainVideos = videoNums
             var imageIndex = 0
@@ -1813,15 +1820,6 @@ extension Qwen3VLLanguage {
                 let llmGridH = h / spatialMergeSize
                 let llmGridW = w / spatialMergeSize
 
-                // Calculate starting index
-                let stIdx: Int
-                if let lastArray = llmPosIdsList.last {
-                    let maxVal = lastArray.max().item(Int.self)
-                    stIdx = maxVal + 1
-                } else {
-                    stIdx = 0
-                }
-
                 // Add text tokens before this visual block
                 let textLen = ed - st
                 if textLen > 0 {
@@ -1829,6 +1827,7 @@ extension Qwen3VLLanguage {
                     index = broadcast(index, to: [3, textLen])
                     index = index + MLXArray(stIdx)
                     llmPosIdsList.append(index)
+                    stIdx += textLen
                 }
 
                 // Add 3D position IDs for visual tokens
@@ -1846,26 +1845,20 @@ extension Qwen3VLLanguage {
                 wIndex = broadcast(wIndex, to: [llmGridT, llmGridH, llmGridW])
                 wIndex = wIndex.flattened()
 
-                let visualPosIds = stacked([tIndex, hIndex, wIndex]) + MLXArray(textLen + stIdx)
+                let visualPosIds = stacked([tIndex, hIndex, wIndex]) + MLXArray(stIdx)
                 llmPosIdsList.append(visualPosIds)
+                stIdx += llmGridT * llmGridH * llmGridW
 
                 st = ed + llmGridT * llmGridH * llmGridW
             }
 
             // Add remaining text tokens after last visual block
             if st < inputTokens.count {
-                let stIdx: Int
-                if let lastArray = llmPosIdsList.last {
-                    let maxVal = lastArray.max().item(Int.self)
-                    stIdx = maxVal + 1
-                } else {
-                    stIdx = 0
-                }
-
                 let textLen = inputTokens.count - st
                 var tIndex = MLXArray(0 ..< textLen).reshaped([1, textLen])
                 tIndex = broadcast(tIndex, to: [3, textLen])
                 llmPosIdsList.append(tIndex + MLXArray(stIdx))
+                stIdx += textLen
             }
 
             // Concatenate all position IDs for this batch item
@@ -1883,8 +1876,8 @@ extension Qwen3VLLanguage {
                 // Replace this batch's position IDs (assumes batch size = 1)
                 positionIds = newPositions
 
-                let maxPosId = llmPositions.max().item(Int.self)
-                mropePositionDeltas.append(maxPosId + 1 - inputTokens.count)
+                // Use stIdx - 1 (max position) instead of llmPositions.max().item(Int.self) to avoid device sync
+                mropePositionDeltas.append(stIdx - inputTokens.count)
             }
         }
 

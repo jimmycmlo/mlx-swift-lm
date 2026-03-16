@@ -7,7 +7,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import MLXLMCommon
 import MLXNN
 import Tokenizers
@@ -55,7 +54,7 @@ private func makeBitLinearKernel() -> MLXFast.MLXFastKernel {
         }
         """
 
-    return metalKernel(
+    return MLXFast.metalKernel(
         name: "bitlinear_matmul",
         inputNames: ["x", "packed_weights", "weight_scale"],
         outputNames: ["out"],
@@ -63,7 +62,7 @@ private func makeBitLinearKernel() -> MLXFast.MLXFastKernel {
     )
 }
 
-final class BitLinearKernelManager: @unchecked Sendable {
+private final class BitLinearKernelManager: Sendable {
     static let shared = BitLinearKernelManager()
 
     let bitlinearKernel: MLXFast.MLXFastKernel
@@ -277,7 +276,7 @@ class BitnetAttention: Module {
 
     @ModuleInfo(key: "attn_sub_norm") var attnSubNorm: RMSNorm
 
-    let rope: RoPE
+    let rope: RoPELayer
 
     init(_ args: BitnetConfiguration) {
         self.args = args
@@ -296,23 +295,10 @@ class BitnetAttention: Module {
 
         _attnSubNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
-        let ropeScale: Float
-        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-            let factor = ropeScaling["factor"]
-        {
-            if let v = factor.asFloat() {
-                ropeScale = 1 / v
-            } else {
-                fatalError("ropeScaling.factor must be a float")
-            }
-        } else {
-            ropeScale = 1
-        }
-
-        rope = RoPE(
-            dimensions: headDim, traditional: args.ropeTraditional, base: args.ropeTheta,
-            scale: ropeScale
-        )
+        self.rope = initializeRope(
+            dims: headDim, base: args.ropeTheta,
+            traditional: args.ropeTraditional, scalingConfig: args.ropeScaling,
+            maxPositionEmbeddings: args.maxPositionEmbeddings)
     }
 
     func callAsFunction(
@@ -335,8 +321,8 @@ class BitnetAttention: Module {
             keys = rope(keys, offset: cache.offset)
             (keys, values) = cache.update(keys: keys, values: values)
         } else {
-            queries = rope(queries)
-            keys = rope(keys)
+            queries = rope(queries, offset: 0)
+            keys = rope(keys, offset: 0)
         }
 
         let output = MLXFast.scaledDotProductAttention(

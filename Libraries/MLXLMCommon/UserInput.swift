@@ -40,17 +40,37 @@ public struct UserInput {
         }
     }
 
+    public struct VideoFrame {
+        public let frame: CIImage
+        public let timeStamp: CMTime
+
+        public init(frame: CIImage, timeStamp: CMTime) {
+            self.frame = frame
+            self.timeStamp = timeStamp
+        }
+    }
+
     /// Representation of a video resource.
     public enum Video {
         case avAsset(AVAsset)
         case url(URL)
+        /// Useful for decoded frames held in memory
+        case frames([VideoFrame])
 
+        @available(
+            *, deprecated,
+            message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
+        )
         public func asAVAsset() -> AVAsset {
             switch self {
             case .avAsset(let asset):
                 return asset
             case .url(let url):
                 return AVAsset(url: url)
+            case .frames:
+                fatalError(
+                    "calling asAVAsset() on Video Input with VideoFames provided is unsupported and deprecated - please use MediaProcessing.asProcessedSequence() instead"
+                )
             }
         }
     }
@@ -314,11 +334,11 @@ public struct UserInput {
 /// Protocol for a type that can convert ``UserInput`` to ``LMInput``.
 ///
 /// See also ``ModelContext``.
-public protocol UserInputProcessor {
+public protocol UserInputProcessor: Sendable {
     func prepare(input: UserInput) async throws -> LMInput
 }
 
-private enum UserInputError: LocalizedError {
+internal enum UserInputError: LocalizedError {
     case notImplemented
     case unableToLoad(URL)
     case arrayError(String)

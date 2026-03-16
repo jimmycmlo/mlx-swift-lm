@@ -5,12 +5,12 @@
 //  Created by John Mai on 2025/6/16.
 //
 
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/baichuan_m1.py
+
 import Foundation
 import MLX
-import MLXFast
 import MLXLMCommon
 import MLXNN
-import MLXRandom
 
 public struct BaichuanM1Configuration: Codable, Sendable {
     var vocabularySize: Int

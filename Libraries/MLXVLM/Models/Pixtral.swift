@@ -1,12 +1,11 @@
 import CoreImage
 import Foundation
 import MLX
-import MLXFast
 import MLXLMCommon
 import MLXNN
 import Tokenizers
 
-// Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/pixtral
+// Port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/pixtral
 
 // MARK: - Vision Configuration
 
@@ -1010,7 +1009,7 @@ public struct PixtralProcessorConfiguration: Codable, Sendable {
 
 // MARK: - Processor
 
-public class PixtralProcessor: UserInputProcessor {
+public struct PixtralProcessor: UserInputProcessor {
     private let config: PixtralProcessorConfiguration
     private let tokenizer: any Tokenizer
     private let imageTokenId: Int

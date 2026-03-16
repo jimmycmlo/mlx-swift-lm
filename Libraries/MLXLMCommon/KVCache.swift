@@ -81,7 +81,7 @@ public protocol KVCache: Evaluatable {
 /// if let quantizedCache = cache as? QuantizedKVCacheProtocol {
 ///     let (qKeys, qValues) = quantizedCache.updateQuantized(keys: k, values: v)
 ///     // Use native quantized operations
-///     let scores = quantizedMatmul(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
+///     let scores = quantizedMM(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
 /// } else {
 ///     // Regular path
 ///     let (k, v) = cache.update(keys: k, values: v)
@@ -136,13 +136,9 @@ open class BaseKVCache: KVCache {
     }
 
     open var metaState: [String] {
-        get {
-            // Python base class returns empty string, but we return empty array for Swift compatibility
-            // This is handled in the save/load functions
-            []
-        }
+        get { [""] }
         set {
-            if !newValue.isEmpty {
+            guard newValue.count == 1 && newValue[0].isEmpty else {
                 fatalError("This cache has no meta_state but a meta_state was set.")
             }
         }
@@ -193,6 +189,31 @@ public func createCausalMask(
     }
 
     return mask
+}
+
+/// Create an attention mask matching mlx-lm's create_attention_mask helper.
+///
+/// This returns `.causal` when a symbolic mask is sufficient, avoiding
+/// materializing a full mask array.
+public func makeAttentionMask(
+    n: Int,
+    cache: KVCache?,
+    windowSize: Int? = nil,
+    returnArray: Bool = false
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    if let cache {
+        return cache.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
+    if n == 1 {
+        return .none
+    }
+
+    if returnArray || (windowSize != nil && n > windowSize!) {
+        return .array(createCausalMask(n: n, offset: 0, windowSize: windowSize))
+    }
+
+    return .causal
 }
 
 /// Create an attention mask using the parameters from the KVCache.
@@ -361,15 +382,6 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             self.keys = newValue[0]
             self.values = newValue[1]
             self.offset = self.keys!.dim(2)
-        }
-    }
-
-    public override var metaState: [String] {
-        get { [] }
-        set {
-            if !newValue.isEmpty {
-                fatalError("KVCacheSimple should not have metaState.")
-            }
         }
     }
 
@@ -1158,16 +1170,18 @@ public func savePromptCache(
     // Use Python-compatible class names for cross-platform compatibility
     let cacheClasses = cache.map { cache -> String in
         switch cache {
+        case is ChunkedKVCache:
+            return "ChunkedKVCache"  // Must precede KVCacheSimple because of inheritance
         case is KVCacheSimple:
             return "KVCache"  // Python uses "KVCache" for the basic cache
         case is RotatingKVCache:
             return "RotatingKVCache"
         case is QuantizedKVCache:
             return "QuantizedKVCache"
-        case is ChunkedKVCache:
-            return "ChunkedKVCache"
         case is MambaCache:
-            return "MambaCache"
+            return "MambaCache"  // Must precede ArraysCache because of inheritance
+        case is ArraysCache:
+            return "ArraysCache"
         case is CacheList:
             return "CacheList"
         default:
@@ -1213,7 +1227,7 @@ public func savePromptCache(
 /// - Returns: The prompt cache and the metadata
 public func loadPromptCache(
     url: URL
-) throws -> ([KVCache], [String: String]?) {
+) throws -> ([KVCache], [String: String]) {
     let (arrays, metadata) = try loadArraysAndMetadata(url: url)
 
     // Unflatten arrays using tree_unflatten compatible logic
@@ -1268,6 +1282,10 @@ public func loadPromptCache(
             cache = ChunkedKVCache()
         case "MambaCache":
             cache = MambaCache()
+        case "ArraysCache":
+            // Size doesn't matter here as it's only needed to initialize the `cache` container inside
+            // The container will be set as a `state` with correct size before returning a cache
+            cache = ArraysCache(size: 0)
         case "CacheList":
             // Note: CacheList requires special handling as it contains sub-caches
             // For now, create an empty CacheList - this may not work correctly
@@ -1466,7 +1484,7 @@ public func quantizedScaledDotProductAttention(
     }
 
     // Compute attention scores using quantized matmul
-    var scores = quantizedMatmul(
+    var scores = quantizedMM(
         scaledQueries, qKeys.0, scales: qKeys.1, biases: qKeys.2,
         transpose: true, groupSize: groupSize, bits: bits,
         mode: mode
@@ -1506,7 +1524,7 @@ public func quantizedScaledDotProductAttention(
     let attentionWeights = softmax(scores, axis: -1)
 
     // Compute output using quantized matmul
-    var output = quantizedMatmul(
+    var output = quantizedMM(
         attentionWeights, qValues.0, scales: qValues.1, biases: qValues.2,
         transpose: false, groupSize: groupSize, bits: bits,
         mode: mode

@@ -6,7 +6,7 @@ import MLX
 import MLXLMCommon
 import Tokenizers
 
-public enum VLMError: LocalizedError {
+public enum VLMError: LocalizedError, Equatable {
     case imageRequired
     case maskRequired
     case singleImageAllowed
@@ -14,6 +14,8 @@ public enum VLMError: LocalizedError {
     case singleMediaTypeAllowed
     case imageProcessingFailure(String)
     case processing(String)
+    case noVideoTrackFound
+    case videoNotDecodable
 
     public var errorDescription: String? {
         switch self {
@@ -33,6 +35,10 @@ public enum VLMError: LocalizedError {
             return String(localized: "Failed to process the image: \(details)")
         case .processing(let details):
             return String(localized: "Processing error: \(details)")
+        case .noVideoTrackFound:
+            return String(localized: "Video file has no video tracks.")
+        case .videoNotDecodable:
+            return String(localized: "Video file not decodable.")
         }
     }
 }
@@ -50,7 +56,7 @@ private func create<C: Codable, M>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
 ) -> (Data) throws -> M {
     { data in
-        let configuration = try JSONDecoder().decode(C.self, from: data)
+        let configuration = try JSONDecoder.json5().decode(C.self, from: data)
         return modelInit(configuration)
     }
 }
@@ -64,7 +70,7 @@ private func create<C: Codable, P>(
         ) -> P
 ) -> (Data, any Tokenizer) throws -> P {
     { data, tokenizer in
-        let configuration = try JSONDecoder().decode(C.self, from: data)
+        let configuration = try JSONDecoder.json5().decode(C.self, from: data)
         return processorInit(configuration, tokenizer)
     }
 }
@@ -80,6 +86,8 @@ public enum VLMTypeRegistry {
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
+        "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "smolvlm": create(SmolVLM2Configuration.self, SmolVLM2.init),
@@ -88,6 +96,8 @@ public enum VLMTypeRegistry {
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
         "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
         "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
+        "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+        "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
     ])
 }
 
@@ -115,6 +125,8 @@ public enum VLMProcessorTypeRegistry {
             PixtralProcessorConfiguration.self, PixtralProcessor.init),
         "Mistral3Processor": create(
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
+        "Lfm2VlProcessor": create(
+            LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
     ])
 }
 
@@ -164,6 +176,16 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Describe the image in English"
     )
 
+    static public let lfm2_5_vl_1_6B_4bit = ModelConfiguration(
+        id: "mlx-community/LFM2.5-VL-1.6B-4bit",
+        defaultPrompt: ""
+    )
+
+    static public let lfm2_vl_1_6B_4bit = ModelConfiguration(
+        id: "mlx-community/LFM2-VL-1.6B-4bit",
+        defaultPrompt: ""
+    )
+
     static public let mistral3_3B_Instruct_4bit = ModelConfiguration(
         id: "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
         defaultPrompt: ""
@@ -198,6 +220,31 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Describe this image in detail."
     )
 
+    static public let qwen3_5_27B_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-27B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let qwen3_5_35B_A3B_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-35B-A3B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let `qwen3_5_2B-4bit` = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-2B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let `qwen3_5_4B-4bit` = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-4B-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
+    static public let `qwen3_5_0.8B-4bit` = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-0.8B-MLX-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
     static public func all() -> [ModelConfiguration] {
         [
             paligemma3bMix448_8bit,
@@ -206,6 +253,9 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3VL4BInstruct4Bit,
             qwen3VL4BInstruct8Bit,
             qwen3VL2BInstruct4Bit,
+            `qwen3_5_2B-4bit`,
+            `qwen3_5_4B-4bit`,
+            `qwen3_5_0.8B-4bit`,
             smolvlminstruct4bit,
             gemma3_4B_qat_4bit,
             gemma3_12B_qat_4bit,
@@ -287,7 +337,7 @@ public final class VLMModelFactory: ModelFactory {
         }
         let baseConfig: BaseConfiguration
         do {
-            baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
+            baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -301,6 +351,21 @@ public final class VLMModelFactory: ModelFactory {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
         }
+
+        // Load EOS token IDs from config.json, with optional override from generation_config.json
+        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
+        if let generationData = try? Data(contentsOf: generationConfigURL),
+            let generationConfig = try? JSONDecoder.json5().decode(
+                GenerationConfigFile.self, from: generationData),
+            let genEosIds = generationConfig.eosTokenIds?.values
+        {
+            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
+        }
+
+        // Create mutable configuration with loaded EOS token IDs
+        var mutableConfiguration = configuration
+        mutableConfiguration.eosTokenIds = eosTokenIds
 
         // Load tokenizer, processor config, and weights in parallel using async let.
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
@@ -341,7 +406,8 @@ public final class VLMModelFactory: ModelFactory {
             processorType: processorType, tokenizer: tokenizer)
 
         return .init(
-            configuration: configuration, model: model, processor: processor, tokenizer: tokenizer)
+            configuration: mutableConfiguration, model: model, processor: processor,
+            tokenizer: tokenizer)
     }
 
 }
@@ -366,7 +432,7 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
         : processorConfigURL
     do {
         let data = try Data(contentsOf: url)
-        let config = try JSONDecoder().decode(BaseProcessorConfiguration.self, from: data)
+        let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
         return (data, config)
     } catch {
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
